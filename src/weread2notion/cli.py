@@ -14,6 +14,7 @@ from retrying import retry
 from .blocks import (
     get_callout,
     get_date,
+    get_file,
     get_heading,
     get_icon,
     get_multi_select,
@@ -30,8 +31,12 @@ from .blocks import (
 client = None
 data_source_id = None
 data_source_property_types = {}
+data_source_properties = {}
 title_property_name = None
 skipped_property_names = set()
+relation_target_cache = {}
+relation_page_cache = {}
+relation_error_names = set()
 weread = None
 
 load_dotenv()
@@ -54,6 +59,7 @@ PROPERTY_DEFAULTS = {
     "progress": ("NOTION_PROGRESS_PROPERTY", "微信读书进度"),
     "completed_date": ("NOTION_COMPLETED_DATE_PROPERTY", "时间"),
     "last_read_date": ("NOTION_LAST_READ_DATE_PROPERTY", "最后阅读时间"),
+    "start_read_date": ("NOTION_START_READ_DATE_PROPERTY", "开始阅读时间"),
 }
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
@@ -158,7 +164,7 @@ def is_enabled(name):
 
 
 def get_existing_page_mode():
-    mode = (os.getenv("NOTION_EXISTING_PAGE_MODE") or "preserve").strip().lower()
+    mode = (os.getenv("NOTION_EXISTING_PAGE_MODE") or "append").strip().lower()
     if mode not in {"preserve", "append"}:
         fail_config("NOTION_EXISTING_PAGE_MODE 只能是 preserve 或 append")
     return mode
@@ -243,10 +249,13 @@ def get_read_info(bookId):
         marked_status = 1
     return {
         "markedStatus": marked_status,
-        "readingTime": book.get("recordReadingTime") or 0,
+        # The live Gateway currently exposes total duration as readingTime for
+        # many books while recordReadingTime remains zero.
+        "readingTime": book.get("readingTime") or book.get("recordReadingTime") or 0,
         "readingProgress": reading_progress,
         "finishedDate": finish_time or None,
         "lastReadDate": update_time or None,
+        "startReadDate": book.get("startReadingTime") or None,
     }
 
 
@@ -270,38 +279,54 @@ def normalize_rating(value):
 def get_bookinfo(bookId):
     """获取书的详情"""
     data = weread.request("/book/info", bookId=bookId)
-    isbn = data.get("isbn", "")
-    newRating = normalize_rating(data.get("newRating"))
-    return (isbn, newRating)
+    metadata = {
+        "isbn": data.get("isbn") or None,
+        "rating": normalize_rating(data.get("newRating")) or None,
+        "author": data.get("author") or None,
+        "cover": data.get("cover") or None,
+        "intro": data.get("intro") or None,
+        "category": data.get("category") or None,
+        "publisher": data.get("publisher") or None,
+        "publishTime": data.get("publishTime") or None,
+    }
+    return {name: value for name, value in metadata.items() if value is not None}
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
 def get_review_list(bookId):
-    """获取笔记"""
+    """获取当前用户的想法、章节点评和整本书评。"""
     reviews_data = []
     hasMore = 1
     synckey = 0
+    seen_synckeys = set()
     while hasMore:
-        data = weread.request("/review/list/mine", bookid=bookId, synckey=synckey, count=100)
+        data = weread.request(
+            "/review/list/mine", bookid=bookId, synckey=synckey, count=100
+        )
         hasMore = data.get("hasMore", 0)
-        synckey = data.get("synckey", 0)
+        next_synckey = data.get("synckey", 0)
         batch = data.get("reviews") or []
         reviews_data.extend(batch)
-        if not batch:
+        if not batch or (hasMore and next_synckey in seen_synckeys):
             hasMore = 0
-    summary = list(filter(lambda x: (x.get("review") or {}).get("type") == 4, reviews_data))
-    reviews = list(filter(lambda x: (x.get("review") or {}).get("type") == 1, reviews_data))
-    reviews = list(map(lambda x: x.get("review") or {}, reviews))
-    reviews = list(
-        map(
-            lambda x: {
-                **x,
-                "markText": x.pop("content", ""),
-                "_callout_icon": NOTE_CALLOUT_ICON,
-            },
-            reviews,
+        seen_synckeys.add(next_synckey)
+        synckey = next_synckey
+    summary = []
+    reviews = []
+    for item in reviews_data:
+        review = dict(item.get("review") or {})
+        if not review.get("content"):
+            continue
+        has_location = any(
+            review.get(name) not in (None, "", 0)
+            for name in ("abstract", "range", "chapterUid", "chapterIdx", "chapterName")
         )
-    )
+        if not has_location:
+            summary.append({"review": review})
+            continue
+        review["markText"] = review.pop("content", "")
+        review["_callout_icon"] = NOTE_CALLOUT_ICON
+        reviews.append(review)
     return summary, reviews
 
 
@@ -323,20 +348,39 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def build_book_properties(bookName, bookId, sort, isbn, rating, read_info):
+def build_book_properties(book, sort, metadata, read_info):
+    book_name = book.get("title") or "未命名书籍"
+    book_id = book.get("bookId")
+    metadata = metadata or {}
     status_property = get_property_name("status")
     duration_property = get_property_name("duration")
     progress_property = get_property_name("progress")
     completed_date_property = get_property_name("completed_date")
     last_read_date_property = get_property_name("last_read_date")
+    start_read_date_property = get_property_name("start_read_date")
+
+    cover = metadata.get("cover") or book.get("cover")
+    author = metadata.get("author") or book.get("author")
+    category = metadata.get("category") or book.get("category")
+    deep_link = book.get("deepLink")
+    web_link = f"https://weread.qq.com/web/reader/{calculate_book_str_id(book_id)}"
+    if deep_link and str(deep_link).startswith(("http://", "https://")):
+        web_link = deep_link
 
     raw_properties = {
-        title_property_name: bookName,
-        "BookId": bookId,
-        "ISBN": isbn,
-        "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
+        title_property_name: book_name,
+        "BookId": book_id,
+        "ISBN": metadata.get("isbn"),
+        "链接": web_link,
         "Sort": sort,
-        "评分": rating,
+        "评分": metadata.get("rating"),
+        "封面": cover if cover and str(cover).startswith("http") else None,
+        "简介": metadata.get("intro"),
+        "作者": author,
+        "分类": category,
+        "出版社": metadata.get("publisher"),
+        "出版时间": metadata.get("publishTime"),
+        "书架分类": (book.get("archiveNames") or [None])[0],
     }
     if read_info:
         raw_properties.update(
@@ -348,26 +392,28 @@ def build_book_properties(bookName, bookId, sort, isbn, rating, read_info):
                 progress_property: read_info.get("readingProgress", 0),
                 completed_date_property: read_info.get("finishedDate"),
                 last_read_date_property: read_info.get("lastReadDate"),
+                start_read_date_property: read_info.get("startReadDate"),
             }
         )
     return build_notion_properties(raw_properties)
 
 
-def upsert_to_notion(bookName, bookId, cover, sort, isbn, rating, existing_page):
+def upsert_to_notion(book, sort, metadata, existing_page):
     """创建页面或原位更新已有页面，不删除用户页面。"""
+    book_id = book.get("bookId")
+    metadata = metadata or {}
+    cover = metadata.get("cover") or book.get("cover")
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
     read_property_names = tuple(
         get_property_name(key) for key in PROPERTY_DEFAULTS
     )
     read_info = (
-        get_read_info(bookId=bookId)
+        get_read_info(bookId=book_id)
         if has_any_property(read_property_names)
         else None
     )
-    properties = build_book_properties(
-        bookName, bookId, sort, isbn, rating, read_info
-    )
+    properties = build_book_properties(book, sort, metadata, read_info)
     icon = get_icon(cover)
     if existing_page:
         page_id = existing_page["id"]
@@ -471,10 +517,11 @@ def replace_managed_content(page_id, children, grandchild, page_existed):
 
 
 def get_notebooklist():
-    """获取笔记本列表"""
+    """获取所有包含个人笔记的书，按 lastSort 游标完整分页。"""
     books = []
     hasMore = 1
     lastSort = None
+    seen_cursors = set()
     while hasMore:
         params = {"count": 100}
         if lastSort is not None:
@@ -484,32 +531,104 @@ def get_notebooklist():
         batch = data.get("books") or []
         books.extend(batch)
         if batch:
-            lastSort = batch[-1].get("sort")
+            next_sort = batch[-1].get("sort")
+            if next_sort is None or next_sort in seen_cursors:
+                break
+            seen_cursors.add(next_sort)
+            lastSort = next_sort
         else:
             hasMore = 0
     books.sort(key=lambda x: x.get("sort") or 0)
     return books
 
 
-def get_sort():
-    """获取 data source 中的最新时间"""
-    filter = build_is_not_empty_filter("Sort")
-    sorts = [
-        {
-            "property": "Sort",
-            "direction": "descending",
-        }
-    ]
-    response = query_data_source(filter=filter, sorts=sorts, page_size=1)
-    if len(response.get("results")) == 1:
-        return get_number_property_value(
-            response.get("results")[0].get("properties").get("Sort")
+def get_books_to_sync():
+    """合并整个电子书书架与笔记本数据，确保无笔记书籍也能同步。"""
+    shelf = weread.request("/shelf/sync")
+    shelf_books = shelf.get("books") or []
+    notebooks = get_notebooklist()
+    notebook_by_id = {}
+    for notebook in notebooks:
+        nested_book = notebook.get("book") or {}
+        book_id = notebook.get("bookId") or nested_book.get("bookId")
+        if book_id:
+            notebook_by_id[book_id] = notebook
+
+    archive_names_by_book = {}
+    for archive in shelf.get("archive") or []:
+        archive_name = archive.get("name")
+        if not archive_name:
+            continue
+        for book_id in archive.get("bookIds") or []:
+            archive_names_by_book.setdefault(book_id, []).append(archive_name)
+
+    merged = []
+    seen_book_ids = set()
+    for shelf_book in shelf_books:
+        book_id = shelf_book.get("bookId")
+        if not book_id:
+            continue
+        notebook = notebook_by_id.get(book_id) or {}
+        notebook_book = notebook.get("book") or {}
+        item = {**shelf_book, **notebook_book}
+        item.update(
+            {
+                "bookId": book_id,
+                "sort": notebook.get("sort")
+                or shelf_book.get("readUpdateTime")
+                or shelf_book.get("updateTime")
+                or 0,
+                "noteCount": notebook.get("noteCount") or 0,
+                "reviewCount": notebook.get("reviewCount") or 0,
+                "bookmarkCount": notebook.get("bookmarkCount") or 0,
+                "hasNotebook": bool(notebook),
+                "archiveNames": archive_names_by_book.get(book_id, []),
+            }
         )
-    return 0
+        merged.append(item)
+        seen_book_ids.add(book_id)
+
+    # Imported or removed books can remain in notebooks even when absent from
+    # the current shelf response. Keep them so their notes are not lost.
+    for book_id, notebook in notebook_by_id.items():
+        if book_id in seen_book_ids:
+            continue
+        item = {**(notebook.get("book") or {})}
+        item.update(
+            {
+                "bookId": book_id,
+                "sort": notebook.get("sort") or 0,
+                "noteCount": notebook.get("noteCount") or 0,
+                "reviewCount": notebook.get("reviewCount") or 0,
+                "bookmarkCount": notebook.get("bookmarkCount") or 0,
+                "hasNotebook": True,
+                "archiveNames": archive_names_by_book.get(book_id, []),
+            }
+        )
+        merged.append(item)
+
+    album_count = len(shelf.get("albums") or [])
+    if album_count:
+        print(f"提示: 书架还有 {album_count} 个专辑/有声书，当前 Notion 书籍结构暂不支持同步")
+    if shelf.get("mp"):
+        print("提示: 书架包含文章收藏入口，Gateway 不返回其中的文章列表")
+    merged.sort(key=lambda item: item.get("sort") or 0)
+    print(
+        f"微信读书数据: {len(shelf_books)} 本电子书，"
+        f"{len(notebooks)} 本包含个人笔记，本次合并同步 {len(merged)} 本"
+    )
+    return merged
 
 
-def should_refresh_content(sort, latest_sort, full_sync, existing_page):
-    return full_sync or not existing_page or sort > latest_sort
+def get_existing_book_sort(existing_page):
+    if not existing_page:
+        return 0
+    properties = existing_page.get("properties") or {}
+    return get_number_property_value(properties.get("Sort"))
+
+
+def should_refresh_content(sort, existing_sort, full_sync, existing_page):
+    return full_sync or not existing_page or (sort or 0) > (existing_sort or 0)
 
 
 def get_children(chapter, summary, bookmark_list):
@@ -617,11 +736,12 @@ def get_children(chapter, summary, bookmark_list):
             markText = data.get("markText") or ""
             if not markText:
                 continue
+            callout_icon = data.get("_callout_icon") or BOOKMARK_CALLOUT_ICON
             for i in range(0, len(markText) // 2000 + 1):
                 children.append(
                     get_callout(
                         markText[i * 2000 : (i + 1) * 2000],
-                        icon=BOOKMARK_CALLOUT_ICON,
+                        icon=callout_icon,
                     )
                 )
     if summary != None and len(summary) > 0:
@@ -707,9 +827,11 @@ def query_data_source(**body):
 
 def load_data_source_schema():
     """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
-    global data_source_property_types, title_property_name, skipped_property_names
+    global data_source_properties, data_source_property_types
+    global title_property_name, skipped_property_names
     response = client.request(path=f"data_sources/{data_source_id}", method="GET")
     properties = response.get("properties") or {}
+    data_source_properties = properties
     data_source_property_types = {
         name: (config or {}).get("type") for name, config in properties.items()
     }
@@ -744,7 +866,8 @@ def load_data_source_schema():
         f"时长={get_property_name('duration')}, "
         f"进度={get_property_name('progress')}, "
         f"完成时间={get_property_name('completed_date')}, "
-        f"最后阅读={get_property_name('last_read_date')}"
+        f"最后阅读={get_property_name('last_read_date')}, "
+        f"开始阅读={get_property_name('start_read_date')}"
     )
 
 
@@ -834,6 +957,99 @@ def build_option_property(prop_type, value):
     return get_multi_select(names)
 
 
+def get_relation_target(name):
+    if name in relation_target_cache:
+        return relation_target_cache[name]
+    property_config = data_source_properties.get(name) or {}
+    relation = property_config.get("relation") or {}
+    target_id = relation.get("data_source_id")
+    if not target_id and relation.get("database_id"):
+        relation_database_id = relation["database_id"]
+        try:
+            client.request(
+                path=f"data_sources/{relation_database_id}", method="GET"
+            )
+            target_id = relation_database_id
+        except APIResponseError as error:
+            code = getattr(error.code, "value", error.code)
+            if code not in {"object_not_found", "validation_error"}:
+                raise
+            database = client.request(
+                path=f"databases/{relation_database_id}", method="GET"
+            )
+            sources = database.get("data_sources") or []
+            if sources:
+                target_id = sources[0].get("id")
+    if not target_id:
+        raise Exception("Notion 未返回关联数据库 ID")
+    response = client.request(path=f"data_sources/{target_id}", method="GET")
+    properties = response.get("properties") or {}
+    target_title = next(
+        (
+            property_name
+            for property_name, config in properties.items()
+            if (config or {}).get("type") == "title"
+        ),
+        None,
+    )
+    if not target_title:
+        raise Exception("关联数据库缺少 Title 属性")
+    relation_target_cache[name] = (target_id, target_title)
+    return relation_target_cache[name]
+
+
+def find_or_create_relation_page(property_name, value):
+    value = to_text(value).strip()
+    if not value:
+        return None
+    cache_key = (property_name, value)
+    if cache_key in relation_page_cache:
+        return relation_page_cache[cache_key]
+    target_id, target_title = get_relation_target(property_name)
+    response = client.request(
+        path=f"data_sources/{target_id}/query",
+        method="POST",
+        body={
+            "filter": {
+                "property": target_title,
+                "title": {"equals": value},
+            },
+            "page_size": 1,
+        },
+    )
+    results = response.get("results") or []
+    if results:
+        page_id = results[0]["id"]
+    else:
+        page = client.pages.create(
+            parent={"type": "data_source_id", "data_source_id": target_id},
+            properties={target_title: get_title(value)},
+        )
+        page_id = page["id"]
+    relation_page_cache[cache_key] = page_id
+    return page_id
+
+
+def build_relation_property(name, value):
+    try:
+        page_ids = [
+            page_id
+            for item in to_name_list(value)
+            if (page_id := find_or_create_relation_page(name, item))
+        ]
+        if not page_ids:
+            return None
+        return {"relation": [{"id": page_id} for page_id in page_ids]}
+    except Exception as error:
+        if name not in relation_error_names:
+            print(
+                f"属性 {name} 的关联库暂时无法写入，保留原值。"
+                f"请确认 Notion Integration 已连接该关联库。原因: {error}"
+            )
+            relation_error_names.add(name)
+        return None
+
+
 def build_notion_property(name, value):
     prop_type = get_property_type(name)
     if not prop_type:
@@ -859,6 +1075,11 @@ def build_notion_property(name, value):
         return get_date(normalize_date_value(value))
     if prop_type == "checkbox":
         return {"checkbox": bool(value)}
+    if prop_type == "files":
+        text = to_text(value)
+        return get_file(text) if text.startswith(("http://", "https://")) else None
+    if prop_type == "relation":
+        return build_relation_property(name, value)
 
     if name not in skipped_property_names:
         print(f"属性 {name} 的类型 {prop_type} 暂不支持写入，自动跳过")
@@ -926,51 +1147,72 @@ def sync():
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
-    latest_sort = get_sort()
     full_sync = is_enabled("FULL_SYNC")
     if full_sync:
         print("已启用全量同步：将逐本匹配 BookId 并原位更新")
-    books = get_notebooklist()
-    if books != None:
-        for index, book in enumerate(books):
-            sort = book["sort"]
-            book = book.get("book") or book
-            title = book.get("title") or ""
-            cover = (book.get("cover") or "").replace("/s_", "/t7_")
-            bookId = book.get("bookId")
-            if not bookId:
-                continue
-            if not matches_book_filter(bookId):
-                continue
-            print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            existing_page = find_book_page(bookId)
+    books = get_books_to_sync()
+    failures = []
+    metadata_properties = (
+        "ISBN",
+        "评分",
+        "封面",
+        "简介",
+        "作者",
+        "分类",
+        "出版社",
+        "出版时间",
+    )
+    for index, book in enumerate(books):
+        sort = book.get("sort") or 0
+        title = book.get("title") or "未命名书籍"
+        cover = (book.get("cover") or "").replace("/s_", "/t7_")
+        book["cover"] = cover
+        book_id = book.get("bookId")
+        if not book_id or not matches_book_filter(book_id):
+            continue
+        print(f"正在同步 {title}，一共 {len(books)} 本，当前是第 {index + 1} 本。")
+        try:
+            existing_page = find_book_page(book_id)
+            existing_sort = get_existing_book_sort(existing_page)
             refresh_content = should_refresh_content(
-                sort, latest_sort, full_sync, existing_page
+                sort, existing_sort, full_sync, existing_page
             )
-            if refresh_content and has_any_property(("ISBN", "评分")):
-                isbn, rating = get_bookinfo(bookId)
-            else:
-                isbn, rating = None, None
-            id, page_existed = upsert_to_notion(
-                title, bookId, cover, sort, isbn, rating, existing_page
+            metadata = {}
+            if (
+                (full_sync or not existing_page or refresh_content)
+                and has_any_property(metadata_properties)
+            ):
+                metadata = get_bookinfo(book_id)
+            page_id, page_existed = upsert_to_notion(
+                book, sort, metadata, existing_page
             )
-            if not refresh_content:
+            if not refresh_content or not book.get("hasNotebook"):
                 continue
-            chapter = get_chapter_info(bookId)
-            bookmark_list = get_bookmark_list(bookId)
-            summary, reviews = get_review_list(bookId)
+            chapter = get_chapter_info(book_id)
+            bookmark_list = get_bookmark_list(book_id)
+            summary, reviews = get_review_list(book_id)
             bookmark_list.extend(reviews)
             bookmark_list = sorted(
                 bookmark_list,
-                key=lambda x: get_note_sort_key(x, chapter),
+                key=lambda item: get_note_sort_key(item, chapter),
             )
             children, grandchild = get_children(chapter, summary, bookmark_list)
             replace_managed_content(
-                id,
+                page_id,
                 children,
                 grandchild,
                 page_existed=page_existed,
             )
+        except Exception as error:
+            failures.append((title, book_id, str(error)))
+            print(f"同步失败，继续处理下一本: {title} ({book_id}): {error}")
+
+    if failures:
+        failed_titles = "、".join(title for title, _, _ in failures[:10])
+        raise Exception(
+            f"本次有 {len(failures)} 本书同步失败: {failed_titles}。"
+            "其余书籍已处理，请查看上方日志定位原因。"
+        )
 
 
 def main(argv=None):

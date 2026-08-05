@@ -25,7 +25,7 @@ inputs:
   existing-page-mode:
     description: Preserve legacy page bodies or append a managed sync section.
     required: false
-    default: preserve
+    default: append
   book-id:
     description: Optional WeRead BookId for a one-book test run.
     required: false
@@ -49,6 +49,10 @@ inputs:
     description: Notion last-read date property name.
     required: false
     default: 最后阅读时间
+  notion-start-read-date-property:
+    description: Notion first-read date property name.
+    required: false
+    default: 开始阅读时间
   python-version:
     description: Python version used to run the sync.
     required: false
@@ -82,4 +86,5 @@ runs:
         NOTION_PROGRESS_PROPERTY: ${{ inputs.notion-progress-property }}
         NOTION_COMPLETED_DATE_PROPERTY: ${{ inputs.notion-completed-date-property }}
         NOTION_LAST_READ_DATE_PROPERTY: ${{ inputs.notion-last-read-date-property }}
+        NOTION_START_READ_DATE_PROPERTY: ${{ inputs.notion-start-read-date-property }}
       run: weread2notion sync

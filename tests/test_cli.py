@@ -10,6 +10,10 @@ class CliTestCase(unittest.TestCase):
     def setUp(self):
         cli.title_property_name = "书名"
         cli.skipped_property_names = set()
+        cli.data_source_properties = {}
+        cli.relation_target_cache.clear()
+        cli.relation_page_cache.clear()
+        cli.relation_error_names.clear()
         cli.data_source_id = "data-source-id"
         cli.data_source_property_types = {
             "书名": "title",
@@ -23,21 +27,23 @@ class CliTestCase(unittest.TestCase):
             "微信读书进度": "number",
             "时间": "date",
             "最后阅读时间": "date",
+            "开始阅读时间": "date",
+            "封面": "files",
+            "简介": "rich_text",
         }
 
     def test_build_book_properties_matches_existing_database(self):
         properties = cli.build_book_properties(
-            "测试书",
-            "book-id",
+            {"title": "测试书", "bookId": "book-id"},
             123,
-            "9780000000000",
-            8.6,
+            {"isbn": "9780000000000", "rating": 8.6},
             {
                 "markedStatus": 4,
                 "readingTime": 23819,
                 "readingProgress": 0.2,
                 "finishedDate": 1754352000,
                 "lastReadDate": 1754438400,
+                "startReadDate": 1754265600,
             },
         )
 
@@ -47,30 +53,127 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(properties["BookId"]["rich_text"][0]["text"]["content"], "book-id")
         self.assertIn("时间", properties)
         self.assertIn("最后阅读时间", properties)
+        self.assertIn("开始阅读时间", properties)
 
     def test_unfinished_book_does_not_write_completed_date(self):
         properties = cli.build_book_properties(
-            "在读书",
-            "book-id",
+            {"title": "在读书", "bookId": "book-id"},
             123,
-            "",
-            None,
+            {},
             {
                 "markedStatus": 2,
                 "readingTime": 60,
                 "readingProgress": 0.1,
                 "finishedDate": None,
                 "lastReadDate": 1754438400,
+                "startReadDate": None,
             },
         )
 
         self.assertEqual(properties["阅读状态"], {"status": {"name": "在读"}})
         self.assertNotIn("时间", properties)
 
+    def test_optional_metadata_does_not_clear_existing_values(self):
+        properties = cli.build_book_properties(
+            {"title": "测试书", "bookId": "book-id"},
+            123,
+            {},
+            None,
+        )
+
+        self.assertNotIn("ISBN", properties)
+        self.assertNotIn("评分", properties)
+        self.assertNotIn("简介", properties)
+        self.assertNotIn("封面", properties)
+
+    def test_cover_file_property_is_written(self):
+        properties = cli.build_book_properties(
+            {
+                "title": "测试书",
+                "bookId": "book-id",
+                "cover": "https://example.com/cover.jpg",
+            },
+            123,
+            {},
+            None,
+        )
+
+        self.assertEqual(
+            properties["封面"]["files"][0]["external"]["url"],
+            "https://example.com/cover.jpg",
+        )
+
     def test_normalize_reading_progress(self):
         self.assertEqual(cli.normalize_reading_progress(20), 0.2)
         self.assertEqual(cli.normalize_reading_progress(0.2), 0.2)
         self.assertEqual(cli.normalize_reading_progress(150), 1)
+
+    def test_read_info_prefers_live_reading_time_and_maps_start_date(self):
+        cli.weread = SimpleNamespace(
+            request=Mock(
+                return_value={
+                    "book": {
+                        "progress": 20,
+                        "readingTime": 30674,
+                        "recordReadingTime": 0,
+                        "startReadingTime": 1642427133,
+                        "updateTime": 1747499863,
+                    }
+                }
+            )
+        )
+
+        result = cli.get_read_info("book-id")
+
+        self.assertEqual(result["readingTime"], 30674)
+        self.assertEqual(result["readingProgress"], 0.2)
+        self.assertEqual(result["startReadDate"], 1642427133)
+
+    def test_read_info_falls_back_to_record_reading_time(self):
+        cli.weread = SimpleNamespace(
+            request=Mock(
+                return_value={
+                    "book": {
+                        "progress": 1,
+                        "recordReadingTime": 90,
+                    }
+                }
+            )
+        )
+
+        self.assertEqual(cli.get_read_info("book-id")["readingTime"], 90)
+
+    def test_personal_reviews_are_not_filtered_by_undocumented_type(self):
+        cli.weread = SimpleNamespace(
+            request=Mock(
+                return_value={
+                    "hasMore": 0,
+                    "synckey": 1,
+                    "reviews": [
+                        {
+                            "review": {
+                                "type": 1,
+                                "content": "整本书评论",
+                            }
+                        },
+                        {
+                            "review": {
+                                "type": 99,
+                                "content": "划线想法",
+                                "abstract": "对应原文",
+                                "chapterUid": 1,
+                            }
+                        },
+                    ],
+                }
+            )
+        )
+
+        summary, notes = cli.get_review_list("book-id")
+
+        self.assertEqual(summary[0]["review"]["content"], "整本书评论")
+        self.assertEqual(notes[0]["markText"], "划线想法")
+        self.assertEqual(notes[0]["abstract"], "对应原文")
 
     def test_content_refresh_uses_sort_but_properties_can_update_daily(self):
         existing_page = {"id": "page-id"}
@@ -82,6 +185,56 @@ class CliTestCase(unittest.TestCase):
         )
         self.assertTrue(cli.should_refresh_content(100, 100, True, existing_page))
         self.assertTrue(cli.should_refresh_content(100, 100, False, None))
+
+    def test_existing_book_sort_is_read_from_its_own_page(self):
+        page = {
+            "properties": {
+                "Sort": {"type": "number", "number": 123},
+            }
+        }
+
+        self.assertEqual(cli.get_existing_book_sort(page), 123)
+
+    @patch.object(cli, "get_notebooklist")
+    def test_shelf_and_notebooks_are_merged_by_book_id(self, get_notebooks):
+        get_notebooks.return_value = [
+            {
+                "bookId": "book-1",
+                "sort": 300,
+                "noteCount": 2,
+                "reviewCount": 1,
+                "book": {"bookId": "book-1", "title": "笔记标题"},
+            }
+        ]
+        cli.weread = SimpleNamespace(
+            request=Mock(
+                return_value={
+                    "books": [
+                        {
+                            "bookId": "book-1",
+                            "title": "书架标题",
+                            "readUpdateTime": 200,
+                        },
+                        {
+                            "bookId": "book-2",
+                            "title": "无笔记书",
+                            "readUpdateTime": 100,
+                        },
+                    ],
+                    "archive": [{"name": "待读", "bookIds": ["book-2"]}],
+                    "albums": [],
+                }
+            )
+        )
+
+        books = cli.get_books_to_sync()
+        by_id = {book["bookId"]: book for book in books}
+
+        self.assertEqual(len(books), 2)
+        self.assertEqual(by_id["book-1"]["sort"], 300)
+        self.assertTrue(by_id["book-1"]["hasNotebook"])
+        self.assertFalse(by_id["book-2"]["hasNotebook"])
+        self.assertEqual(by_id["book-2"]["archiveNames"], ["待读"])
 
     @patch.dict(os.environ, {"WEREAD_BOOK_ID": "target-book"}, clear=False)
     def test_optional_book_filter(self):
@@ -108,12 +261,16 @@ class CliTestCase(unittest.TestCase):
             "readingProgress": 0.1,
             "finishedDate": None,
             "lastReadDate": None,
+            "startReadDate": None,
         }
         pages = SimpleNamespace(update=Mock(), create=Mock())
         cli.client = SimpleNamespace(pages=pages)
 
         page_id, existed = cli.upsert_to_notion(
-            "测试书", "book-id", "", 123, "", None, {"id": "page-id"}
+            {"title": "测试书", "bookId": "book-id", "cover": ""},
+            123,
+            {},
+            {"id": "page-id"},
         )
 
         self.assertEqual(page_id, "page-id")
