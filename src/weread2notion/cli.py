@@ -6,6 +6,7 @@ import time
 from notion_client import Client
 import requests
 from datetime import datetime
+from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
 from notion_client.errors import APIResponseError
@@ -22,6 +23,7 @@ from .blocks import (
     get_select,
     get_status,
     get_title,
+    get_toggle,
     get_url,
 )
 
@@ -39,6 +41,20 @@ WEREAD_SKILL_VERSION = "1.0.4"
 NOTION_VERSION = "2026-03-11"
 BOOKMARK_CALLOUT_ICON = "〰️"
 NOTE_CALLOUT_ICON = "✍️"
+MANAGED_CONTENT_TITLE = "微信读书同步内容（自动更新）"
+SHANGHAI_TIME_ZONE = ZoneInfo("Asia/Shanghai")
+STATUS_MAP = {
+    1: "想读",
+    2: "在读",
+    4: "已读",
+}
+PROPERTY_DEFAULTS = {
+    "status": ("NOTION_STATUS_PROPERTY", "阅读状态"),
+    "duration": ("NOTION_DURATION_PROPERTY", "阅读时长"),
+    "progress": ("NOTION_PROGRESS_PROPERTY", "微信读书进度"),
+    "completed_date": ("NOTION_COMPLETED_DATE_PROPERTY", "时间"),
+    "last_read_date": ("NOTION_LAST_READ_DATE_PROPERTY", "最后阅读时间"),
+}
 NOTION_TOKEN_PATTERN = re.compile(r"^(secret|ntn)_[A-Za-z0-9_-]{20,}$")
 WEREAD_API_KEY_PATTERN = re.compile(r"^[A-Za-z0-9._~+/=-]{10,}$")
 NOTION_ID_PATTERN = re.compile(
@@ -132,6 +148,27 @@ def validate_secret_inputs():
     }
 
 
+def get_property_name(key):
+    env_name, default = PROPERTY_DEFAULTS[key]
+    return os.getenv(env_name, default).strip() or default
+
+
+def is_enabled(name):
+    return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_existing_page_mode():
+    mode = (os.getenv("NOTION_EXISTING_PAGE_MODE") or "preserve").strip().lower()
+    if mode not in {"preserve", "append"}:
+        fail_config("NOTION_EXISTING_PAGE_MODE 只能是 preserve 或 append")
+    return mode
+
+
+def matches_book_filter(book_id):
+    target_book_id = (os.getenv("WEREAD_BOOK_ID") or "").strip()
+    return not target_book_id or book_id == target_book_id
+
+
 class WeReadGatewayClient:
     def __init__(self, api_key):
         if not api_key:
@@ -208,7 +245,8 @@ def get_read_info(bookId):
         "markedStatus": marked_status,
         "readingTime": book.get("recordReadingTime") or 0,
         "readingProgress": reading_progress,
-        "finishedDate": finish_time,
+        "finishedDate": finish_time or None,
+        "lastReadDate": update_time or None,
     }
 
 
@@ -267,15 +305,14 @@ def get_review_list(bookId):
     return summary, reviews
 
 
-def check(bookId):
-    """检查是否已经插入过 如果已经插入了就删除"""
+def find_book_page(bookId):
+    """按 BookId 查找已有页面，避免删除并重建整个页面。"""
     filter = build_equals_filter("BookId", bookId)
-    response = query_data_source(filter=filter)
-    for result in response["results"]:
-        try:
-            client.blocks.delete(block_id=result["id"])
-        except Exception as e:
-            print(f"删除块时出错: {e}")
+    response = query_data_source(filter=filter, page_size=2)
+    results = response.get("results") or []
+    if len(results) > 1:
+        print(f"警告: BookId={bookId} 匹配到多个页面，将更新第一个页面")
+    return results[0] if results else None
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
@@ -286,64 +323,80 @@ def get_chapter_info(bookId):
     return {item["chapterUid"]: item for item in chapters if "chapterUid" in item}
 
 
-def insert_to_notion(bookName, bookId, cover, sort, author, isbn, rating, categories):
-    """插入到notion"""
-    if not cover or not cover.startswith("http"):
-        cover = "https://www.notion.so/icons/book_gray.svg"
-    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+def build_book_properties(bookName, bookId, sort, isbn, rating, read_info):
+    status_property = get_property_name("status")
+    duration_property = get_property_name("duration")
+    progress_property = get_property_name("progress")
+    completed_date_property = get_property_name("completed_date")
+    last_read_date_property = get_property_name("last_read_date")
+
     raw_properties = {
         title_property_name: bookName,
         "BookId": bookId,
         "ISBN": isbn,
         "链接": f"https://weread.qq.com/web/reader/{calculate_book_str_id(bookId)}",
-        "作者": author,
         "Sort": sort,
         "评分": rating,
     }
-    if categories != None:
-        raw_properties["分类"] = categories
+    if read_info:
+        raw_properties.update(
+            {
+                status_property: STATUS_MAP.get(
+                    read_info.get("markedStatus"), "想读"
+                ),
+                duration_property: read_info.get("readingTime", 0),
+                progress_property: read_info.get("readingProgress", 0),
+                completed_date_property: read_info.get("finishedDate"),
+                last_read_date_property: read_info.get("lastReadDate"),
+            }
+        )
+    return build_notion_properties(raw_properties)
+
+
+def upsert_to_notion(bookName, bookId, cover, sort, isbn, rating, existing_page):
+    """创建页面或原位更新已有页面，不删除用户页面。"""
+    if not cover or not cover.startswith("http"):
+        cover = "https://www.notion.so/icons/book_gray.svg"
+    read_property_names = tuple(
+        get_property_name(key) for key in PROPERTY_DEFAULTS
+    )
     read_info = (
         get_read_info(bookId=bookId)
-        if has_any_property(("状态", "阅读时长", "阅读进度", "时间"))
+        if has_any_property(read_property_names)
         else None
     )
-    if read_info != None:
-        markedStatus = read_info.get("markedStatus", 0)
-        readingTime = read_info.get("readingTime", 0)
-        readingProgress = read_info.get("readingProgress", 0)
-        format_time = ""
-        hour = readingTime // 3600
-        if hour > 0:
-            format_time += f"{hour}时"
-        minutes = readingTime % 3600 // 60
-        if minutes > 0:
-            format_time += f"{minutes}分"
-        raw_properties["状态"] = "读完" if markedStatus == 4 else "在读"
-        raw_properties["阅读时长"] = format_time
-        raw_properties["阅读进度"] = readingProgress
-        if "finishedDate" in read_info:
-            raw_properties["时间"] = datetime.utcfromtimestamp(
-                read_info.get("finishedDate")
-            ).strftime(
-                "%Y-%m-%d %H:%M:%S"
-            )
-
-    properties = build_notion_properties(raw_properties)
+    properties = build_book_properties(
+        bookName, bookId, sort, isbn, rating, read_info
+    )
     icon = get_icon(cover)
-    # notion api 限制100个block
-    response = client.pages.create(parent=parent, icon=icon,cover=icon, properties=properties)
-    id = response["id"]
-    return id
+    if existing_page:
+        page_id = existing_page["id"]
+        client.pages.update(
+            page_id=page_id,
+            icon=icon,
+            cover=icon,
+            properties=properties,
+        )
+        return page_id, True
+
+    parent = {"type": "data_source_id", "data_source_id": data_source_id}
+    response = client.pages.create(
+        parent=parent,
+        icon=icon,
+        cover=icon,
+        properties=properties,
+    )
+    return response["id"], False
 
 
 def add_children(id, children):
     results = []
-    for i in range(0, len(children) // 100 + 1):
+    for start in range(0, len(children), 100):
         time.sleep(0.3)
         response = client.blocks.children.append(
-            block_id=id, children=children[i * 100 : (i + 1) * 100]
+            block_id=id, children=children[start : start + 100]
         )
-        results.extend(response.get("results"))
+        results.extend(response.get("results") or [])
     return results if len(results) == len(children) else None
 
 
@@ -352,6 +405,69 @@ def add_grandchild(grandchild, results):
         time.sleep(0.3)
         id = results[key].get("id")
         client.blocks.children.append(block_id=id, children=[value])
+
+
+def get_block_text(block):
+    block_type = block.get("type")
+    block_data = block.get(block_type) or {}
+    return "".join(
+        item.get("plain_text") or (item.get("text") or {}).get("content") or ""
+        for item in block_data.get("rich_text") or []
+    )
+
+
+def list_page_children(page_id):
+    results = []
+    start_cursor = None
+    while True:
+        params = {"block_id": page_id, "page_size": 100}
+        if start_cursor:
+            params["start_cursor"] = start_cursor
+        response = client.blocks.children.list(**params)
+        results.extend(response.get("results") or [])
+        if not response.get("has_more"):
+            break
+        start_cursor = response.get("next_cursor")
+        if not start_cursor:
+            break
+    return results
+
+
+def find_managed_content_blocks(page_id):
+    return [
+        block
+        for block in list_page_children(page_id)
+        if block.get("type") == "toggle"
+        and get_block_text(block) == MANAGED_CONTENT_TITLE
+    ]
+
+
+def replace_managed_content(page_id, children, grandchild, page_existed):
+    managed_blocks = find_managed_content_blocks(page_id)
+    if page_existed and not managed_blocks and get_existing_page_mode() == "preserve":
+        print(
+            "已有页面没有受管同步区域：为保护原正文，本次只更新数据库属性。"
+            "如需追加受管区域，请手动运行时选择 existing-page-mode=append。"
+        )
+        return False
+
+    container_results = add_children(page_id, [get_toggle(MANAGED_CONTENT_TITLE)])
+    if not container_results:
+        raise Exception("创建微信读书受管同步区域失败")
+    container_id = container_results[0]["id"]
+    try:
+        results = add_children(container_id, children)
+        if results is None:
+            raise Exception("写入微信读书受管同步内容失败")
+        if grandchild:
+            add_grandchild(grandchild, results)
+    except Exception:
+        client.blocks.delete(block_id=container_id)
+        raise
+
+    for block in managed_blocks:
+        client.blocks.delete(block_id=block["id"])
+    return True
 
 
 def get_notebooklist():
@@ -390,6 +506,10 @@ def get_sort():
             response.get("results")[0].get("properties").get("Sort")
         )
     return 0
+
+
+def should_refresh_content(sort, latest_sort, full_sync, existing_page):
+    return full_sync or not existing_page or sort > latest_sort
 
 
 def get_children(chapter, summary, bookmark_list):
@@ -618,6 +738,14 @@ def load_data_source_schema():
         f"已读取 Notion 属性 {len(data_source_property_types)} 个，"
         f"标题属性: {title_property_name}"
     )
+    print(
+        "字段映射: "
+        f"状态={get_property_name('status')}, "
+        f"时长={get_property_name('duration')}, "
+        f"进度={get_property_name('progress')}, "
+        f"完成时间={get_property_name('completed_date')}, "
+        f"最后阅读={get_property_name('last_read_date')}"
+    )
 
 
 def get_property_type(name):
@@ -689,7 +817,9 @@ def to_number(value):
 
 def normalize_date_value(value):
     if isinstance(value, (int, float)):
-        return datetime.utcfromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+        return datetime.fromtimestamp(value, SHANGHAI_TIME_ZONE).strftime(
+            "%Y-%m-%dT%H:%M:%S"
+        )
     return value
 
 
@@ -797,31 +927,35 @@ def sync():
     print(f"Notion Data Source ID: {data_source_id}")
     load_data_source_schema()
     latest_sort = get_sort()
+    full_sync = is_enabled("FULL_SYNC")
+    if full_sync:
+        print("已启用全量同步：将逐本匹配 BookId 并原位更新")
     books = get_notebooklist()
     if books != None:
         for index, book in enumerate(books):
             sort = book["sort"]
-            if sort <= latest_sort:
-                continue
             book = book.get("book") or book
             title = book.get("title") or ""
             cover = (book.get("cover") or "").replace("/s_", "/t7_")
             bookId = book.get("bookId")
-            author = book.get("author") or ""
             if not bookId:
                 continue
-            categories = book.get("categories")
-            if categories != None:
-                categories = [x["title"] for x in categories]
+            if not matches_book_filter(bookId):
+                continue
             print(f"正在同步 {title} ,一共{len(books)}本，当前是第{index+1}本。")
-            check(bookId)
-            if has_any_property(("ISBN", "评分")):
+            existing_page = find_book_page(bookId)
+            refresh_content = should_refresh_content(
+                sort, latest_sort, full_sync, existing_page
+            )
+            if refresh_content and has_any_property(("ISBN", "评分")):
                 isbn, rating = get_bookinfo(bookId)
             else:
-                isbn, rating = "", None
-            id = insert_to_notion(
-                title, bookId, cover, sort, author, isbn, rating, categories
+                isbn, rating = None, None
+            id, page_existed = upsert_to_notion(
+                title, bookId, cover, sort, isbn, rating, existing_page
             )
+            if not refresh_content:
+                continue
             chapter = get_chapter_info(bookId)
             bookmark_list = get_bookmark_list(bookId)
             summary, reviews = get_review_list(bookId)
@@ -831,9 +965,12 @@ def sync():
                 key=lambda x: get_note_sort_key(x, chapter),
             )
             children, grandchild = get_children(chapter, summary, bookmark_list)
-            results = add_children(id, children)
-            if len(grandchild) > 0 and results != None:
-                add_grandchild(grandchild, results)
+            replace_managed_content(
+                id,
+                children,
+                grandchild,
+                page_existed=page_existed,
+            )
 
 
 def main(argv=None):

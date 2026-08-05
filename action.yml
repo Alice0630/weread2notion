@@ -18,6 +18,37 @@ inputs:
   notion-data-source-id:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
+  full-sync:
+    description: Sync every WeRead book instead of only books newer than the latest Sort value.
+    required: false
+    default: "false"
+  existing-page-mode:
+    description: Preserve legacy page bodies or append a managed sync section.
+    required: false
+    default: preserve
+  book-id:
+    description: Optional WeRead BookId for a one-book test run.
+    required: false
+  notion-status-property:
+    description: Notion status property name.
+    required: false
+    default: 阅读状态
+  notion-duration-property:
+    description: Notion reading duration property name.
+    required: false
+    default: 阅读时长
+  notion-progress-property:
+    description: Writable Notion percent property name.
+    required: false
+    default: 微信读书进度
+  notion-completed-date-property:
+    description: Notion completed date property name.
+    required: false
+    default: 时间
+  notion-last-read-date-property:
+    description: Notion last-read date property name.
+    required: false
+    default: 最后阅读时间
   python-version:
     description: Python version used to run the sync.
     required: false
@@ -43,4 +74,12 @@ runs:
         NOTION_PAGE: ${{ inputs.notion-page }}
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
+        FULL_SYNC: ${{ inputs.full-sync }}
+        NOTION_EXISTING_PAGE_MODE: ${{ inputs.existing-page-mode }}
+        WEREAD_BOOK_ID: ${{ inputs.book-id }}
+        NOTION_STATUS_PROPERTY: ${{ inputs.notion-status-property }}
+        NOTION_DURATION_PROPERTY: ${{ inputs.notion-duration-property }}
+        NOTION_PROGRESS_PROPERTY: ${{ inputs.notion-progress-property }}
+        NOTION_COMPLETED_DATE_PROPERTY: ${{ inputs.notion-completed-date-property }}
+        NOTION_LAST_READ_DATE_PROPERTY: ${{ inputs.notion-last-read-date-property }}
       run: weread2notion sync
