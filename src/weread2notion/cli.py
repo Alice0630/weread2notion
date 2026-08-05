@@ -5,7 +5,7 @@ import re
 import time
 from notion_client import Client
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
@@ -37,6 +37,9 @@ skipped_property_names = set()
 relation_target_cache = {}
 relation_page_cache = {}
 relation_error_names = set()
+data_source_schema_cache = {}
+existing_pages_by_book_id = None
+resolved_progress_property_name = None
 weread = None
 
 load_dotenv()
@@ -56,7 +59,7 @@ STATUS_MAP = {
 PROPERTY_DEFAULTS = {
     "status": ("NOTION_STATUS_PROPERTY", "阅读状态"),
     "duration": ("NOTION_DURATION_PROPERTY", "阅读时长"),
-    "progress": ("NOTION_PROGRESS_PROPERTY", "微信读书进度"),
+    "progress": ("NOTION_PROGRESS_PROPERTY", "阅读进度"),
     "completed_date": ("NOTION_COMPLETED_DATE_PROPERTY", "时间"),
     "last_read_date": ("NOTION_LAST_READ_DATE_PROPERTY", "最后阅读时间"),
     "start_read_date": ("NOTION_START_READ_DATE_PROPERTY", "开始阅读时间"),
@@ -159,8 +162,61 @@ def get_property_name(key):
     return os.getenv(env_name, default).strip() or default
 
 
+def get_progress_property_name():
+    """Choose the writable progress number property without touching formulas."""
+    global resolved_progress_property_name
+    if resolved_progress_property_name:
+        return resolved_progress_property_name
+    configured = get_property_name("progress")
+    if configured in data_source_property_types:
+        resolved_progress_property_name = configured
+        return resolved_progress_property_name
+    for fallback in ("阅读进度", "微信阅读进度", "微信读书进度"):
+        if data_source_property_types.get(fallback) == "number":
+            print(f"进度字段映射: {configured} 不可写，改用数字字段 {fallback}")
+            resolved_progress_property_name = fallback
+            return resolved_progress_property_name
+    if configured in data_source_property_types:
+        print(
+            f"提示: {configured} 是 {data_source_property_types[configured]} 字段，"
+            "不能直接写入。请保留一个 Number/Percent 类型的阅读进度字段"
+        )
+    resolved_progress_property_name = configured
+    return resolved_progress_property_name
+
+
+def get_writable_progress_properties():
+    """Keep compatible progress number fields in sync without touching formulas."""
+    primary = get_progress_property_name()
+    names = [primary]
+    for name in ("阅读进度", "微信阅读进度", "微信读书进度"):
+        if data_source_property_types.get(name) == "number" and name not in names:
+            names.append(name)
+    return names
+
+
 def is_enabled(name):
     return (os.getenv(name) or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def get_nonnegative_int(name, default):
+    raw = (os.getenv(name) or "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        fail_config(f"{name} 必须是整数")
+    if value < 0:
+        fail_config(f"{name} 不能小于 0")
+    return value
+
+
+def get_positive_int(name, default):
+    value = get_nonnegative_int(name, default)
+    if value == 0:
+        fail_config(f"{name} 必须大于 0")
+    return value
 
 
 def get_existing_page_mode():
@@ -332,12 +388,52 @@ def get_review_list(bookId):
 
 def find_book_page(bookId):
     """按 BookId 查找已有页面，避免删除并重建整个页面。"""
+    if existing_pages_by_book_id is not None:
+        return existing_pages_by_book_id.get(bookId)
     filter = build_equals_filter("BookId", bookId)
     response = query_data_source(filter=filter, page_size=2)
     results = response.get("results") or []
     if len(results) > 1:
         print(f"警告: BookId={bookId} 匹配到多个页面，将更新第一个页面")
     return results[0] if results else None
+
+
+def get_page_text_property(property_value):
+    if not property_value:
+        return ""
+    prop_type = property_value.get("type")
+    values = property_value.get(prop_type) or []
+    if isinstance(values, list):
+        return "".join(
+            item.get("plain_text")
+            or (item.get("text") or {}).get("content")
+            or ""
+            for item in values
+        )
+    return ""
+
+
+def preload_existing_pages():
+    """Load existing BookId pages once, avoiding one Notion query per book."""
+    pages_by_book_id = {}
+    start_cursor = None
+    while True:
+        body = {"page_size": 100}
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        response = query_data_source(**body)
+        for page in response.get("results") or []:
+            properties = page.get("properties") or {}
+            book_id = get_page_text_property(properties.get("BookId"))
+            if book_id and book_id not in pages_by_book_id:
+                pages_by_book_id[book_id] = page
+        if not response.get("has_more"):
+            break
+        start_cursor = response.get("next_cursor")
+        if not start_cursor:
+            break
+    print(f"已载入现有 Notion 页面索引: {len(pages_by_book_id)} 本")
+    return pages_by_book_id
 
 
 @retry(stop_max_attempt_number=3, wait_fixed=5000)
@@ -354,7 +450,7 @@ def build_book_properties(book, sort, metadata, read_info):
     metadata = metadata or {}
     status_property = get_property_name("status")
     duration_property = get_property_name("duration")
-    progress_property = get_property_name("progress")
+    progress_properties = get_writable_progress_properties()
     completed_date_property = get_property_name("completed_date")
     last_read_date_property = get_property_name("last_read_date")
     start_read_date_property = get_property_name("start_read_date")
@@ -376,12 +472,21 @@ def build_book_properties(book, sort, metadata, read_info):
         "评分": metadata.get("rating"),
         "封面": cover if cover and str(cover).startswith("http") else None,
         "简介": metadata.get("intro"),
+    }
+    optional_properties = {
         "作者": author,
         "分类": category,
         "出版社": metadata.get("publisher"),
         "出版时间": metadata.get("publishTime"),
         "书架分类": (book.get("archiveNames") or [None])[0],
     }
+    raw_properties.update(
+        {
+            name: value
+            for name, value in optional_properties.items()
+            if name in data_source_property_types
+        }
+    )
     if read_info:
         raw_properties.update(
             {
@@ -389,12 +494,16 @@ def build_book_properties(book, sort, metadata, read_info):
                     read_info.get("markedStatus"), "想读"
                 ),
                 duration_property: read_info.get("readingTime", 0),
-                progress_property: read_info.get("readingProgress", 0),
                 completed_date_property: read_info.get("finishedDate"),
                 last_read_date_property: read_info.get("lastReadDate"),
                 start_read_date_property: read_info.get("startReadDate"),
             }
         )
+        for progress_property in progress_properties:
+            raw_properties[progress_property] = read_info.get("readingProgress", 0)
+        for period_name, period_title in get_reading_periods(read_info).items():
+            if period_name in data_source_property_types:
+                raw_properties[period_name] = period_title
     return build_notion_properties(raw_properties)
 
 
@@ -406,7 +515,10 @@ def upsert_to_notion(book, sort, metadata, existing_page):
     if not cover or not cover.startswith("http"):
         cover = "https://www.notion.so/icons/book_gray.svg"
     read_property_names = tuple(
-        get_property_name(key) for key in PROPERTY_DEFAULTS
+        get_progress_property_name()
+        if key == "progress"
+        else get_property_name(key)
+        for key in PROPERTY_DEFAULTS
     )
     read_info = (
         get_read_info(bookId=book_id)
@@ -574,6 +686,12 @@ def get_books_to_sync():
         item.update(
             {
                 "bookId": book_id,
+                "contentSort": notebook.get("sort") or 0,
+                "activityTime": max(
+                    shelf_book.get("readUpdateTime") or 0,
+                    notebook.get("sort") or 0,
+                ),
+                "lastReadTime": shelf_book.get("readUpdateTime") or 0,
                 "sort": notebook.get("sort")
                 or shelf_book.get("readUpdateTime")
                 or shelf_book.get("updateTime")
@@ -597,6 +715,9 @@ def get_books_to_sync():
         item.update(
             {
                 "bookId": book_id,
+                "contentSort": notebook.get("sort") or 0,
+                "activityTime": notebook.get("sort") or 0,
+                "lastReadTime": 0,
                 "sort": notebook.get("sort") or 0,
                 "noteCount": notebook.get("noteCount") or 0,
                 "reviewCount": notebook.get("reviewCount") or 0,
@@ -620,11 +741,70 @@ def get_books_to_sync():
     return merged
 
 
+def select_books_for_run(books, full_sync):
+    """Limit manual full syncs to a stable, resumable batch."""
+    target_book_id = (os.getenv("WEREAD_BOOK_ID") or "").strip()
+    target_year = (os.getenv("SYNC_YEAR") or "").strip()
+    candidates = [
+        book
+        for book in books
+        if (not target_book_id or book.get("bookId") == target_book_id)
+        and (
+            not target_year
+            or get_reading_year({"lastReadDate": book.get("lastReadTime")})
+            == target_year
+        )
+    ]
+    if target_year:
+        print(f"已启用年份过滤: 只处理最后阅读年份为 {target_year} 的书")
+    if not full_sync:
+        return sorted(
+            candidates,
+            key=lambda book: book.get("activityTime") or 0,
+            reverse=True,
+        )
+    candidates.sort(key=lambda book: str(book.get("bookId") or ""))
+    batch_size = get_positive_int("BATCH_SIZE", 25)
+    batch_index = get_nonnegative_int("BATCH_INDEX", 0)
+    total_batches = (len(candidates) + batch_size - 1) // batch_size
+    start = batch_index * batch_size
+    end = min(start + batch_size, len(candidates))
+    if start >= len(candidates):
+        print(
+            f"全量批次 {batch_index} 超出范围，本次没有书籍。"
+            f"有效批次为 0-{max(total_batches - 1, 0)}"
+        )
+        return []
+    print(
+        f"全量批次: {batch_index}/{max(total_batches - 1, 0)}，"
+        f"本批 {start + 1}-{end}/{len(candidates)} 本，批大小 {batch_size}"
+    )
+    return candidates[start:end]
+
+
 def get_existing_book_sort(existing_page):
     if not existing_page:
         return 0
     properties = existing_page.get("properties") or {}
     return get_number_property_value(properties.get("Sort"))
+
+
+def get_existing_last_read_date(existing_page):
+    if not existing_page:
+        return 0
+    properties = existing_page.get("properties") or {}
+    property_value = properties.get(get_property_name("last_read_date")) or {}
+    date_value = property_value.get("date") or {}
+    start = date_value.get("start")
+    if not start:
+        return 0
+    try:
+        parsed = datetime.fromisoformat(str(start).replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=SHANGHAI_TIME_ZONE)
+        return int(parsed.timestamp())
+    except (TypeError, ValueError, OverflowError):
+        return 0
 
 
 def should_refresh_content(sort, existing_sort, full_sync, existing_page):
@@ -804,9 +984,12 @@ def calculate_book_str_id(book_id):
 
 def extract_notion_id():
     url_or_id = (
-        os.getenv("NOTION_DATA_SOURCE_ID")
+        # A database ID is the authoritative target when both IDs are set.
+        # Older workflow versions accepted a stale data source ID first,
+        # which could silently sync a different 21-property data source.
+        os.getenv("NOTION_DATABASE_ID")
+        or os.getenv("NOTION_DATA_SOURCE_ID")
         or os.getenv("NOTION_PAGE")
-        or os.getenv("NOTION_DATABASE_ID")
     )
     if not url_or_id:
         fail_config("没有找到 NOTION_PAGE / NOTION_DATA_SOURCE_ID，请按照文档填写")
@@ -828,10 +1011,12 @@ def query_data_source(**body):
 def load_data_source_schema():
     """读取当前 data source 的真实属性，只强制要求同步游标需要的字段。"""
     global data_source_properties, data_source_property_types
-    global title_property_name, skipped_property_names
+    global title_property_name, skipped_property_names, resolved_progress_property_name
     response = client.request(path=f"data_sources/{data_source_id}", method="GET")
     properties = response.get("properties") or {}
     data_source_properties = properties
+    data_source_schema_cache[data_source_id] = properties
+    resolved_progress_property_name = None
     data_source_property_types = {
         name: (config or {}).get("type") for name, config in properties.items()
     }
@@ -860,11 +1045,21 @@ def load_data_source_schema():
         f"已读取 Notion 属性 {len(data_source_property_types)} 个，"
         f"标题属性: {title_property_name}"
     )
+    relation_names = ("作者", "分类", "年", "月", "周", "日", "章节", "划线", "读书笔记")
+    invisible_relations = [
+        name for name in relation_names if name not in data_source_property_types
+    ]
+    if invisible_relations:
+        print(
+            "提示: 以下关联字段对 Integration 不可见: "
+            f"{', '.join(invisible_relations)}。"
+            "请把同一个 Notion Integration 连接到这些关联数据库。"
+        )
     print(
         "字段映射: "
         f"状态={get_property_name('status')}, "
         f"时长={get_property_name('duration')}, "
-        f"进度={get_property_name('progress')}, "
+        f"进度={get_progress_property_name()}, "
         f"完成时间={get_property_name('completed_date')}, "
         f"最后阅读={get_property_name('last_read_date')}, "
         f"开始阅读={get_property_name('start_read_date')}"
@@ -946,6 +1141,69 @@ def normalize_date_value(value):
     return value
 
 
+def get_reading_year(read_info):
+    periods = get_reading_periods(read_info)
+    return periods.get("年")
+
+
+def get_reading_timestamp(read_info):
+    if not read_info:
+        return None
+    return (
+        read_info.get("lastReadDate")
+        or read_info.get("startReadDate")
+        or read_info.get("finishedDate")
+    )
+
+
+def get_period_titles(timestamp):
+    if not timestamp:
+        return {}
+    try:
+        value = datetime.fromtimestamp(float(timestamp), SHANGHAI_TIME_ZONE)
+    except (TypeError, ValueError, OSError, OverflowError):
+        return {}
+    iso_year, iso_week, _ = value.isocalendar()
+    return {
+        "年": str(value.year),
+        "月": f"{value.year}年{value.month}月",
+        "周": f"{iso_year}年第{iso_week}周",
+        "日": value.strftime("%Y年%m月%d日"),
+    }
+
+
+def get_reading_periods(read_info):
+    return get_period_titles(get_reading_timestamp(read_info))
+
+
+def parse_period_start(name, value):
+    value = to_text(value).strip()
+    try:
+        if name == "年":
+            match = re.fullmatch(r"(\d{4})", value)
+            return datetime(int(match.group(1)), 1, 1, tzinfo=SHANGHAI_TIME_ZONE) if match else None
+        if name == "月":
+            match = re.fullmatch(r"(\d{4})年(\d{1,2})月", value)
+            return datetime(int(match.group(1)), int(match.group(2)), 1, tzinfo=SHANGHAI_TIME_ZONE) if match else None
+        if name == "周":
+            match = re.fullmatch(r"(\d{4})年第(\d{1,2})周", value)
+            if match:
+                return datetime.fromisocalendar(
+                    int(match.group(1)), int(match.group(2)), 1
+                ).replace(tzinfo=SHANGHAI_TIME_ZONE)
+        if name == "日":
+            match = re.fullmatch(r"(\d{4})年(\d{2})月(\d{2})日", value)
+            return datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                tzinfo=SHANGHAI_TIME_ZONE,
+            ) if match else None
+    except ValueError:
+        return None
+    return None
+
+
 def build_option_property(prop_type, value):
     names = to_name_list(value)
     if not names:
@@ -955,6 +1213,13 @@ def build_option_property(prop_type, value):
     if prop_type == "select":
         return get_select(names[0])
     return get_multi_select(names)
+
+
+def get_data_source_schema(target_id):
+    if target_id not in data_source_schema_cache:
+        response = client.request(path=f"data_sources/{target_id}", method="GET")
+        data_source_schema_cache[target_id] = response.get("properties") or {}
+    return data_source_schema_cache[target_id]
 
 
 def get_relation_target(name):
@@ -982,8 +1247,7 @@ def get_relation_target(name):
                 target_id = sources[0].get("id")
     if not target_id:
         raise Exception("Notion 未返回关联数据库 ID")
-    response = client.request(path=f"data_sources/{target_id}", method="GET")
-    properties = response.get("properties") or {}
+    properties = get_data_source_schema(target_id)
     target_title = next(
         (
             property_name
@@ -998,6 +1262,25 @@ def get_relation_target(name):
     return relation_target_cache[name]
 
 
+def build_period_page_properties(property_name, value, target_title, schema):
+    properties = {target_title: get_title(value)}
+    start = parse_period_start(property_name, value)
+    if not start:
+        return properties
+    if (schema.get("日期") or {}).get("type") == "date":
+        properties["日期"] = get_date(start.isoformat())
+    if property_name == "日" and (schema.get("时间戳") or {}).get("type") == "number":
+        properties["时间戳"] = get_number(int(start.timestamp()))
+    if property_name == "日":
+        for related_name, related_title in get_period_titles(start.timestamp()).items():
+            if related_name == "日" or (schema.get(related_name) or {}).get("type") != "relation":
+                continue
+            related_id = find_or_create_relation_page(related_name, related_title)
+            if related_id:
+                properties[related_name] = {"relation": [{"id": related_id}]}
+    return properties
+
+
 def find_or_create_relation_page(property_name, value):
     value = to_text(value).strip()
     if not value:
@@ -1006,6 +1289,7 @@ def find_or_create_relation_page(property_name, value):
     if cache_key in relation_page_cache:
         return relation_page_cache[cache_key]
     target_id, target_title = get_relation_target(property_name)
+    schema = get_data_source_schema(target_id)
     response = client.request(
         path=f"data_sources/{target_id}/query",
         method="POST",
@@ -1023,7 +1307,9 @@ def find_or_create_relation_page(property_name, value):
     else:
         page = client.pages.create(
             parent={"type": "data_source_id", "data_source_id": target_id},
-            properties={target_title: get_title(value)},
+            properties=build_period_page_properties(
+                property_name, value, target_title, schema
+            ),
         )
         page_id = page["id"]
     relation_page_cache[cache_key] = page_id
@@ -1095,6 +1381,310 @@ def build_notion_properties(raw_properties):
     }
 
 
+def build_properties_for_schema(schema, raw_properties):
+    properties = {}
+    for name, value in raw_properties.items():
+        config = schema.get(name) or {}
+        prop_type = config.get("type")
+        if not prop_type or value is None:
+            continue
+        if prop_type == "title":
+            properties[name] = get_title(to_text(value)[:2000])
+        elif prop_type == "rich_text":
+            properties[name] = get_rich_text(to_text(value)[:2000])
+        elif prop_type == "number":
+            number = to_number(value)
+            if number is not None:
+                properties[name] = get_number(number)
+        elif prop_type == "date":
+            properties[name] = get_date(normalize_date_value(value))
+        elif prop_type == "url":
+            properties[name] = get_url(to_text(value))
+        elif prop_type == "relation":
+            page_ids = value if isinstance(value, (list, tuple, set)) else [value]
+            page_ids = [to_text(page_id) for page_id in page_ids if page_id]
+            properties[name] = {"relation": [{"id": page_id} for page_id in page_ids]}
+    return properties
+
+
+def get_plain_property_value(property_value):
+    if not property_value:
+        return None
+    prop_type = property_value.get("type")
+    value = property_value.get(prop_type)
+    if prop_type in {"title", "rich_text"}:
+        return "".join(item.get("plain_text") or "" for item in (value or []))
+    if prop_type == "date":
+        return (value or {}).get("start")
+    if prop_type == "relation":
+        return sorted(item.get("id") for item in (value or []) if item.get("id"))
+    if prop_type in {"number", "url", "checkbox"}:
+        return value
+    return value
+
+
+def get_desired_property_value(property_value):
+    if not property_value:
+        return None
+    if "title" in property_value:
+        return "".join(
+            (item.get("text") or {}).get("content") or ""
+            for item in property_value["title"]
+        )
+    if "rich_text" in property_value:
+        return "".join(
+            (item.get("text") or {}).get("content") or ""
+            for item in property_value["rich_text"]
+        )
+    if "date" in property_value:
+        return (property_value.get("date") or {}).get("start")
+    if "relation" in property_value:
+        return sorted(
+            item.get("id") for item in property_value["relation"] if item.get("id")
+        )
+    for name in ("number", "url", "checkbox"):
+        if name in property_value:
+            return property_value[name]
+    return property_value
+
+
+def related_properties_changed(existing_page, desired_properties):
+    existing_properties = (existing_page or {}).get("properties") or {}
+    for name, desired in desired_properties.items():
+        actual_value = get_plain_property_value(existing_properties.get(name))
+        desired_value = get_desired_property_value(desired)
+        if isinstance(actual_value, str) and isinstance(desired_value, str):
+            if actual_value[:19] == desired_value[:19] and "T" in desired_value:
+                continue
+        if actual_value != desired_value:
+            return True
+    return False
+
+
+def normalize_stable_key(value):
+    if isinstance(value, str):
+        return value.strip()
+    number = to_number(value)
+    if number is not None:
+        return str(number)
+    return to_text(value).strip()
+
+
+def query_related_pages(target_id, book_page_id):
+    pages = []
+    start_cursor = None
+    while True:
+        body = {
+            "filter": {
+                "property": "书籍",
+                "relation": {"contains": book_page_id},
+            },
+            "page_size": 100,
+        }
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        response = client.request(
+            path=f"data_sources/{target_id}/query", method="POST", body=body
+        )
+        pages.extend(response.get("results") or [])
+        if not response.get("has_more"):
+            return pages
+        start_cursor = response.get("next_cursor")
+        if not start_cursor:
+            return pages
+
+
+def upsert_related_rows(relation_name, book_page_id, stable_property, rows):
+    if not rows or get_property_type(relation_name) != "relation":
+        return (0, 0, 0)
+    target_id, _ = get_relation_target(relation_name)
+    schema = get_data_source_schema(target_id)
+    if "书籍" not in schema or stable_property not in schema:
+        raise Exception(
+            f"{relation_name} 数据库缺少 书籍 或 {stable_property} 属性"
+        )
+    existing_index = {}
+    for page in query_related_pages(target_id, book_page_id):
+        key = normalize_stable_key(
+            get_plain_property_value((page.get("properties") or {}).get(stable_property))
+        )
+        if key and key not in existing_index:
+            existing_index[key] = page
+    created = updated = unchanged = 0
+    for raw in rows:
+        key = normalize_stable_key(raw.get(stable_property))
+        if not key:
+            continue
+        desired = build_properties_for_schema(schema, raw)
+        existing = existing_index.get(key)
+        if not existing:
+            page = client.pages.create(
+                parent={"type": "data_source_id", "data_source_id": target_id},
+                properties=desired,
+            )
+            existing_index[key] = page
+            created += 1
+        elif related_properties_changed(existing, desired):
+            client.pages.update(page_id=existing["id"], properties=desired)
+            updated += 1
+        else:
+            unchanged += 1
+    print(
+        f"{relation_name} 子库: 新增 {created}，更新 {updated}，未变化 {unchanged}"
+    )
+    return created, updated, unchanged
+
+
+def build_time_relation_values(timestamp):
+    relations = {}
+    for name, title in get_period_titles(timestamp).items():
+        if get_property_type(name) != "relation":
+            continue
+        page_id = find_or_create_relation_page(name, title)
+        if page_id:
+            relations[name] = [page_id]
+    return relations
+
+
+def make_fallback_item_id(prefix, book_id, item):
+    value = "|".join(
+        to_text(item.get(name))
+        for name in ("createTime", "chapterUid", "range", "markText", "content")
+    )
+    return f"{prefix}-{hashlib.sha1(f'{book_id}|{value}'.encode()).hexdigest()}"
+
+
+def sync_book_related_content(book_id, book_page_id, chapters, bookmarks, summary, reviews):
+    chapter_rows = []
+    for uid, chapter in (chapters or {}).items():
+        chapter = dict(chapter)
+        chapter_uid = chapter.get("chapterUid", uid)
+        chapter_rows.append(
+            {
+                "Name": chapter.get("title") or f"章节 {chapter_uid}",
+                "chapterUid": chapter_uid,
+                "chapterIdx": chapter.get("chapterIdx"),
+                "level": chapter.get("level"),
+                "updateTime": chapter.get("updateTime"),
+                "readAhead": chapter.get("readAhead"),
+                "tar": chapter.get("tar"),
+                "blockId": chapter.get("blockId"),
+                "书籍": [book_page_id],
+            }
+        )
+
+    bookmark_rows = []
+    for bookmark in bookmarks or []:
+        bookmark_id = bookmark.get("bookmarkId") or make_fallback_item_id(
+            "bookmark", book_id, bookmark
+        )
+        bookmark_rows.append(
+            {
+                "Name": bookmark.get("markText") or "未命名划线",
+                "bookmarkId": bookmark_id,
+                "bookId": bookmark.get("bookId") or book_id,
+                "Date": bookmark.get("createTime"),
+                "blockId": bookmark.get("blockId"),
+                "bookVersion": bookmark.get("bookVersion"),
+                "chapterUid": bookmark.get("chapterUid"),
+                "colorStyle": bookmark.get("colorStyle"),
+                "range": bookmark.get("range"),
+                "style": bookmark.get("style"),
+                "type": bookmark.get("type"),
+                "书籍": [book_page_id],
+                **build_time_relation_values(bookmark.get("createTime")),
+            }
+        )
+
+    review_items = [item.get("review") or {} for item in (summary or [])]
+    review_items.extend(reviews or [])
+    review_rows = []
+    for review in review_items:
+        review_id = review.get("reviewId") or make_fallback_item_id(
+            "review", book_id, review
+        )
+        review_rows.append(
+            {
+                "Name": review.get("content") or review.get("markText") or "未命名想法",
+                "reviewId": review_id,
+                "bookId": review.get("bookId") or book_id,
+                "Date": review.get("createTime"),
+                "abstract": review.get("abstract"),
+                "blockId": review.get("blockId"),
+                "bookVersion": review.get("bookVersion"),
+                "chapterUid": review.get("chapterUid"),
+                "range": review.get("range"),
+                "star": review.get("star"),
+                "style": review.get("style"),
+                "type": review.get("type"),
+                "书籍": [book_page_id],
+                **build_time_relation_values(review.get("createTime")),
+            }
+        )
+
+    upsert_related_rows("章节", book_page_id, "chapterUid", chapter_rows)
+    upsert_related_rows("划线", book_page_id, "bookmarkId", bookmark_rows)
+    upsert_related_rows("读书笔记", book_page_id, "reviewId", review_rows)
+
+
+def sync_reading_stats():
+    if not is_enabled("SYNC_READING_STATS"):
+        return
+    raw_year = (os.getenv("SYNC_YEAR") or "").strip()
+    stats_year = int(raw_year) if raw_year.isdigit() else datetime.now(SHANGHAI_TIME_ZONE).year
+    now = datetime.now(SHANGHAI_TIME_ZONE)
+    anchor = now if stats_year == now.year else datetime(
+        stats_year, 12, 31, 23, 59, tzinfo=SHANGHAI_TIME_ZONE
+    )
+    base_time = int(
+        datetime(stats_year, 1, 1, tzinfo=SHANGHAI_TIME_ZONE).timestamp()
+    )
+    detail = weread.request(
+        "/readdata/detail", mode="annually", baseTime=base_time
+    )
+    daily_read_times = detail.get("dailyReadTimes") or {}
+    if not daily_read_times:
+        print(f"阅读统计: {stats_year} 年没有返回每日阅读明细")
+        return
+    lookback_days = get_positive_int("STATS_LOOKBACK_DAYS", 14)
+    cutoff = (anchor - timedelta(days=lookback_days - 1)).date()
+    day_target_id, _ = get_relation_target("日")
+    day_schema = get_data_source_schema(day_target_id)
+    written = unchanged = 0
+    for timestamp, seconds in sorted(
+        daily_read_times.items(), key=lambda item: int(item[0])
+    ):
+        try:
+            timestamp = int(timestamp)
+        except (TypeError, ValueError):
+            continue
+        day = datetime.fromtimestamp(timestamp, SHANGHAI_TIME_ZONE)
+        if day.year != stats_year or day.date() < cutoff:
+            continue
+        title = get_period_titles(timestamp).get("日")
+        if not title:
+            continue
+        page_id = find_or_create_relation_page("日", title)
+        raw = {
+            "标题": title,
+            "日期": timestamp,
+            "时间戳": timestamp,
+            "时长": to_number(seconds) or 0,
+            **build_time_relation_values(timestamp),
+        }
+        desired = build_properties_for_schema(day_schema, raw)
+        page = client.pages.retrieve(page_id=page_id)
+        if related_properties_changed(page, desired):
+            client.pages.update(page_id=page_id, properties=desired)
+            written += 1
+        else:
+            unchanged += 1
+    print(
+        f"阅读统计 {stats_year}: 写入 {written} 天，"
+        f"未变化 {unchanged} 天（回看 {lookback_days} 天）"
+    )
+
+
 def get_number_property_value(property_value):
     if not property_value:
         return 0
@@ -1110,9 +1700,6 @@ def get_number_property_value(property_value):
 
 
 def resolve_data_source_id(notion_id):
-    if os.getenv("NOTION_DATA_SOURCE_ID"):
-        return notion_id
-
     try:
         client.request(path=f"data_sources/{notion_id}", method="GET")
         return notion_id
@@ -1125,6 +1712,12 @@ def resolve_data_source_id(notion_id):
     sources = database.get("data_sources") or []
     if not sources:
         raise Exception(f"数据库 {notion_id} 下没有可用的 data source")
+    configured_data_source = os.getenv("NOTION_DATA_SOURCE_ID")
+    if configured_data_source and configured_data_source != sources[0].get("id"):
+        print(
+            "提示: NOTION_DATA_SOURCE_ID 与 NOTION_DATABASE_ID 不匹配，"
+            f"已改用数据库的 data source: {sources[0].get('id')}"
+        )
     if len(sources) > 1:
         print(
             f"数据库 {notion_id} 包含 {len(sources)} 个 data sources，默认使用第一个: {sources[0].get('id')}"
@@ -1133,7 +1726,7 @@ def resolve_data_source_id(notion_id):
 
 
 def sync():
-    global client, data_source_id, weread
+    global client, data_source_id, weread, existing_pages_by_book_id
     secrets = validate_secret_inputs()
     notion_id = extract_notion_id()
     notion_token = secrets["notion_token"]
@@ -1146,11 +1739,20 @@ def sync():
     data_source_id = resolve_data_source_id(notion_id)
     print(f"Notion API Version: {NOTION_VERSION}")
     print(f"Notion Data Source ID: {data_source_id}")
+    relation_target_cache.clear()
+    relation_page_cache.clear()
+    relation_error_names.clear()
+    data_source_schema_cache.clear()
     load_data_source_schema()
+    sync_reading_stats()
+    if is_enabled("STATS_ONLY"):
+        print("已启用仅同步阅读统计，跳过书籍同步")
+        return
     full_sync = is_enabled("FULL_SYNC")
     if full_sync:
         print("已启用全量同步：将逐本匹配 BookId 并原位更新")
-    books = get_books_to_sync()
+    existing_pages_by_book_id = preload_existing_pages()
+    books = select_books_for_run(get_books_to_sync(), full_sync)
     failures = []
     metadata_properties = (
         "ISBN",
@@ -1162,8 +1764,12 @@ def sync():
         "出版社",
         "出版时间",
     )
+    max_changes = get_positive_int("MAX_CHANGES_PER_RUN", 50)
+    changed_count = 0
     for index, book in enumerate(books):
         sort = book.get("sort") or 0
+        content_sort = book.get("contentSort") or 0
+        activity_time = book.get("activityTime") or sort
         title = book.get("title") or "未命名书籍"
         cover = (book.get("cover") or "").replace("/s_", "/t7_")
         book["cover"] = cover
@@ -1175,11 +1781,27 @@ def sync():
             existing_page = find_book_page(book_id)
             existing_sort = get_existing_book_sort(existing_page)
             refresh_content = should_refresh_content(
-                sort, existing_sort, full_sync, existing_page
+                content_sort, existing_sort, full_sync, existing_page
             )
+            property_sync = (
+                full_sync
+                or not existing_page
+                or refresh_content
+                or activity_time > get_existing_last_read_date(existing_page)
+            )
+            if not property_sync:
+                print(f"跳过未变化书籍: {title}")
+                continue
+            if not full_sync and changed_count >= max_changes:
+                print(
+                    f"本次已达到增量写入上限 {max_changes} 本，"
+                    "其余变化将在下次定时任务继续处理"
+                )
+                break
+            changed_count += 1
             metadata = {}
             if (
-                (full_sync or not existing_page or refresh_content)
+                property_sync
                 and has_any_property(metadata_properties)
             ):
                 metadata = get_bookinfo(book_id)
@@ -1191,12 +1813,19 @@ def sync():
             chapter = get_chapter_info(book_id)
             bookmark_list = get_bookmark_list(book_id)
             summary, reviews = get_review_list(book_id)
-            bookmark_list.extend(reviews)
-            bookmark_list = sorted(
+            sync_book_related_content(
+                book_id,
+                page_id,
+                chapter,
                 bookmark_list,
+                summary,
+                reviews,
+            )
+            annotations = sorted(
+                [*bookmark_list, *reviews],
                 key=lambda item: get_note_sort_key(item, chapter),
             )
-            children, grandchild = get_children(chapter, summary, bookmark_list)
+            children, grandchild = get_children(chapter, summary, annotations)
             replace_managed_content(
                 page_id,
                 children,

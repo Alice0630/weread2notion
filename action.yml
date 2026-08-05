@@ -19,7 +19,34 @@ inputs:
     description: Notion data source ID. Preferred for Notion-Version 2026-03-11.
     required: false
   full-sync:
-    description: Sync every WeRead book instead of only books newer than the latest Sort value.
+    description: Run a resumable full sync batch when true.
+    required: false
+    default: "false"
+  batch-size:
+    description: Number of books in each full-sync batch.
+    required: false
+    default: "25"
+  batch-index:
+    description: Zero-based full-sync batch number.
+    required: false
+    default: "0"
+  max-changes:
+    description: Maximum changed books written by a non-full sync.
+    required: false
+    default: "50"
+  sync-year:
+    description: Optional last-read year filter, for example 2026.
+    required: false
+  sync-reading-stats:
+    description: Sync daily reading duration into the existing period databases.
+    required: false
+    default: "true"
+  stats-lookback-days:
+    description: Number of daily reading-stat records to revisit.
+    required: false
+    default: "14"
+  stats-only:
+    description: Skip books and only sync daily reading statistics.
     required: false
     default: "false"
   existing-page-mode:
@@ -40,7 +67,7 @@ inputs:
   notion-progress-property:
     description: Writable Notion percent property name.
     required: false
-    default: 微信读书进度
+    default: 阅读进度
   notion-completed-date-property:
     description: Notion completed date property name.
     required: false
@@ -79,6 +106,13 @@ runs:
         NOTION_DATABASE_ID: ${{ inputs.notion-database-id }}
         NOTION_DATA_SOURCE_ID: ${{ inputs.notion-data-source-id }}
         FULL_SYNC: ${{ inputs.full-sync }}
+        BATCH_SIZE: ${{ inputs.batch-size }}
+        BATCH_INDEX: ${{ inputs.batch-index }}
+        MAX_CHANGES_PER_RUN: ${{ inputs.max-changes }}
+        SYNC_YEAR: ${{ inputs.sync-year }}
+        SYNC_READING_STATS: ${{ inputs.sync-reading-stats }}
+        STATS_LOOKBACK_DAYS: ${{ inputs.stats-lookback-days }}
+        STATS_ONLY: ${{ inputs.stats-only }}
         NOTION_EXISTING_PAGE_MODE: ${{ inputs.existing-page-mode }}
         WEREAD_BOOK_ID: ${{ inputs.book-id }}
         NOTION_STATUS_PROPERTY: ${{ inputs.notion-status-property }}

@@ -14,6 +14,9 @@ class CliTestCase(unittest.TestCase):
         cli.relation_target_cache.clear()
         cli.relation_page_cache.clear()
         cli.relation_error_names.clear()
+        cli.data_source_schema_cache.clear()
+        cli.existing_pages_by_book_id = None
+        cli.resolved_progress_property_name = None
         cli.data_source_id = "data-source-id"
         cli.data_source_property_types = {
             "书名": "title",
@@ -24,7 +27,8 @@ class CliTestCase(unittest.TestCase):
             "评分": "number",
             "阅读状态": "status",
             "阅读时长": "number",
-            "微信读书进度": "number",
+            "阅读进度": "number",
+            "微信阅读进度": "number",
             "时间": "date",
             "最后阅读时间": "date",
             "开始阅读时间": "date",
@@ -49,7 +53,8 @@ class CliTestCase(unittest.TestCase):
 
         self.assertEqual(properties["阅读状态"], {"status": {"name": "已读"}})
         self.assertEqual(properties["阅读时长"], {"number": 23819})
-        self.assertEqual(properties["微信读书进度"], {"number": 0.2})
+        self.assertEqual(properties["阅读进度"], {"number": 0.2})
+        self.assertEqual(properties["微信阅读进度"], {"number": 0.2})
         self.assertEqual(properties["BookId"]["rich_text"][0]["text"]["content"], "book-id")
         self.assertIn("时间", properties)
         self.assertIn("最后阅读时间", properties)
@@ -107,6 +112,108 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(cli.normalize_reading_progress(20), 0.2)
         self.assertEqual(cli.normalize_reading_progress(0.2), 0.2)
         self.assertEqual(cli.normalize_reading_progress(150), 1)
+
+    def test_progress_falls_back_to_legacy_writable_number(self):
+        cli.data_source_property_types.pop("阅读进度")
+
+        self.assertEqual(cli.get_progress_property_name(), "微信阅读进度")
+
+    @patch.object(cli, "build_relation_property")
+    def test_reading_year_maps_last_read_date_to_year_relation(self, relation):
+        cli.data_source_property_types.update(
+            {"年": "relation", "月": "relation", "周": "relation", "日": "relation"}
+        )
+        relation.return_value = {"relation": [{"id": "year-2026"}]}
+
+        properties = cli.build_book_properties(
+            {"title": "测试书", "bookId": "book-id"},
+            123,
+            {},
+            {
+                "markedStatus": 2,
+                "readingTime": 60,
+                "readingProgress": 0.1,
+                "finishedDate": None,
+                "lastReadDate": 1785859200,
+                "startReadDate": None,
+            },
+        )
+
+        self.assertEqual(properties["年"], {"relation": [{"id": "year-2026"}]})
+        relation.assert_any_call("年", "2026")
+        relation.assert_any_call("月", "2026年8月")
+        relation.assert_any_call("周", "2026年第32周")
+        relation.assert_any_call("日", "2026年08月05日")
+
+    def test_period_titles_match_existing_notion_naming(self):
+        self.assertEqual(
+            cli.get_period_titles(1785859200),
+            {
+                "年": "2026",
+                "月": "2026年8月",
+                "周": "2026年第32周",
+                "日": "2026年08月05日",
+            },
+        )
+
+    @patch.object(cli, "query_related_pages")
+    @patch.object(cli, "get_data_source_schema")
+    @patch.object(cli, "get_relation_target")
+    def test_related_rows_are_upserted_by_stable_id(
+        self, relation_target, schema, query_pages
+    ):
+        cli.data_source_property_types["划线"] = "relation"
+        relation_target.return_value = ("highlight-source", "Name")
+        schema.return_value = {
+            "Name": {"type": "title"},
+            "bookmarkId": {"type": "rich_text"},
+            "书籍": {"type": "relation"},
+        }
+        query_pages.return_value = [
+            {
+                "id": "existing-highlight",
+                "properties": {
+                    "Name": {
+                        "type": "title",
+                        "title": [{"plain_text": "旧划线"}],
+                    },
+                    "bookmarkId": {
+                        "type": "rich_text",
+                        "rich_text": [{"plain_text": "bookmark-1"}],
+                    },
+                    "书籍": {
+                        "type": "relation",
+                        "relation": [{"id": "book-page"}],
+                    },
+                },
+            }
+        ]
+        pages = SimpleNamespace(
+            create=Mock(return_value={"id": "new-highlight"}), update=Mock()
+        )
+        cli.client = SimpleNamespace(pages=pages)
+
+        result = cli.upsert_related_rows(
+            "划线",
+            "book-page",
+            "bookmarkId",
+            [
+                {
+                    "Name": "新划线",
+                    "bookmarkId": "bookmark-1",
+                    "书籍": ["book-page"],
+                },
+                {
+                    "Name": "另一条划线",
+                    "bookmarkId": "bookmark-2",
+                    "书籍": ["book-page"],
+                },
+            ],
+        )
+
+        self.assertEqual(result, (1, 1, 0))
+        pages.update.assert_called_once()
+        pages.create.assert_called_once()
 
     def test_read_info_prefers_live_reading_time_and_maps_start_date(self):
         cli.weread = SimpleNamespace(
@@ -194,6 +301,85 @@ class CliTestCase(unittest.TestCase):
         }
 
         self.assertEqual(cli.get_existing_book_sort(page), 123)
+
+    def test_existing_last_read_date_is_parsed(self):
+        page = {
+            "properties": {
+                "最后阅读时间": {
+                    "type": "date",
+                    "date": {"start": "2026-08-05T02:00:00+08:00"},
+                }
+            }
+        }
+
+        self.assertGreater(cli.get_existing_last_read_date(page), 0)
+
+    @patch.dict(
+        os.environ,
+        {
+            "NOTION_DATABASE_ID": "fff7538b60b2815599fdc5d8914f4490",
+            "NOTION_DATA_SOURCE_ID": "11111111111111111111111111111111",
+            "NOTION_PAGE": "https://notion.so/b830a450b3924f7cbca652892c0c3b8a",
+        },
+        clear=False,
+    )
+    def test_database_id_is_authoritative_target(self):
+        self.assertEqual(cli.extract_notion_id(), "fff7538b60b2815599fdc5d8914f4490")
+
+    @patch.dict(
+        os.environ,
+        {"BATCH_SIZE": "2", "BATCH_INDEX": "1", "WEREAD_BOOK_ID": ""},
+        clear=False,
+    )
+    def test_full_sync_batch_is_stable_by_book_id(self):
+        books = [
+            {"bookId": "d"},
+            {"bookId": "a"},
+            {"bookId": "c"},
+            {"bookId": "b"},
+            {"bookId": "e"},
+        ]
+
+        selected = cli.select_books_for_run(books, full_sync=True)
+
+        self.assertEqual([book["bookId"] for book in selected], ["c", "d"])
+
+    def test_incremental_sync_prioritizes_recent_activity(self):
+        books = [
+            {"bookId": "old", "activityTime": 100},
+            {"bookId": "new", "activityTime": 300},
+            {"bookId": "middle", "activityTime": 200},
+        ]
+
+        selected = cli.select_books_for_run(books, full_sync=False)
+
+        self.assertEqual(
+            [book["bookId"] for book in selected],
+            ["new", "middle", "old"],
+        )
+
+    @patch.dict(
+        os.environ,
+        {"SYNC_YEAR": "2026", "WEREAD_BOOK_ID": ""},
+        clear=False,
+    )
+    def test_sync_year_filters_by_last_activity_year(self):
+        books = [
+            {
+                "bookId": "current",
+                "activityTime": 1785859200,
+                "lastReadTime": 1785859200,
+            },
+            {
+                "bookId": "old",
+                "activityTime": 1722816000,
+                "lastReadTime": 1722816000,
+            },
+        ]
+
+        selected = cli.select_books_for_run(books, full_sync=False)
+
+        self.assertEqual([book["bookId"] for book in selected], ["current"])
 
     @patch.object(cli, "get_notebooklist")
     def test_shelf_and_notebooks_are_merged_by_book_id(self, get_notebooks):
