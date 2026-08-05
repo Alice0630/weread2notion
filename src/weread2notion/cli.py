@@ -1866,6 +1866,7 @@ def sync_reading_stats():
             "日期": timestamp,
             "时间戳": timestamp,
             "时长": to_number(seconds) or 0,
+            "阅读小时数": (to_number(seconds) or 0) / 3600,
             **build_time_relation_values(timestamp),
         }
         desired = build_properties_for_schema(day_schema, raw)

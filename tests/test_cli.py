@@ -245,6 +245,24 @@ class CliTestCase(unittest.TestCase):
         self.assertIn("2026-01-01: 1.00 hours", svg)
         self.assertEqual(svg.count("<rect"), 371)
 
+    def test_daily_reading_hours_are_written_as_a_number(self):
+        properties = cli.build_properties_for_schema(
+            {
+                "时长": {"type": "number"},
+                "阅读小时数": {"type": "number"},
+            },
+            {
+                "时长": 3661,
+                "阅读小时数": 3661 / 3600,
+            },
+        )
+
+        self.assertEqual(properties["时长"], {"number": 3661})
+        self.assertAlmostEqual(
+            properties["阅读小时数"]["number"],
+            1.0169444444444444,
+        )
+
     @patch.object(cli, "query_related_pages")
     @patch.object(cli, "get_data_source_schema")
     @patch.object(cli, "get_relation_target")

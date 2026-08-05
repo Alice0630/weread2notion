@@ -76,7 +76,7 @@
 
 首次回填 2026 阅读统计时，可使用 `sync-year=2026`、`stats-only=true`、`stats-lookback-days=366`；正常定时任务保持 `stats-only=false`、`stats-lookback-days=14`。如果年度接口不返回 `dailyReadTimes`，程序会自动按回看范围查询月度 `readTimes` 并按天合并，时长仍统一按秒写入，不再直接跳过阅读统计。
 
-同步完成后，程序会从“日”统计库生成 `OUT_FOLDER/reading-heatmap.svg`。工作流只提交这一张展示文件，并把当前仪表盘的热力图嵌入块切换到本仓库的 SVG；书籍、划线、笔记和统计数据库内容不会因此重建。首次上传新版代码后，先运行一次 `stats-only=true`、`stats-lookback-days=366`，即可回填当年每日数据并刷新热力图；以后每天 02:00 的定时任务会自动更新。
+同步完成后，程序会从“日”统计库生成 `OUT_FOLDER/reading-heatmap.svg`。日库继续保留原始秒数，并额外写入数字字段 `阅读小时数` 供周/月/年图表稳定聚合。工作流只提交这一张展示文件，并用该次提交的唯一 SHA 地址更新仪表盘热力图，避免固定 `main` 地址被缓存；书籍、划线、笔记和统计数据库内容不会因此重建。首次上传新版代码后，先运行一次 `stats-only=true`、`stats-lookback-days=366`，即可回填当年每日数据并刷新热力图；以后每天 02:00 的定时任务会自动更新。
 
 ### 自定义字段名
 
