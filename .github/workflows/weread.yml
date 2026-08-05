@@ -50,6 +50,9 @@ on:
     # GitHub Actions cron uses UTC. 18:00 UTC = 02:00 Asia/Shanghai.
     - cron: "0 18 * * *"
 
+permissions:
+  contents: write
+
 jobs:
   sync:
     name: Sync
@@ -75,3 +78,29 @@ jobs:
           stats-only: ${{ inputs.stats-only || 'false' }}
           existing-page-mode: ${{ inputs.existing-page-mode || 'append' }}
           book-id: ${{ inputs.book-id || '' }}
+      - name: Publish reading heatmap
+        if: ${{ success() }}
+        shell: bash
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+        run: |
+          if [[ ! -f OUT_FOLDER/reading-heatmap.svg ]]; then
+            echo "No heatmap output was generated."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f OUT_FOLDER/reading-heatmap.svg
+          if ! git diff --cached --quiet; then
+            git commit -m "Update reading heatmap"
+            git push origin "HEAD:${GITHUB_REF_NAME}"
+          fi
+          heatmap_url="https://heatmap.malinkang.com/?image=https://raw.githubusercontent.com/Alice0630/weread2notion/main/OUT_FOLDER/reading-heatmap.svg"
+          jq -nc --arg url "$heatmap_url" '{embed:{url:$url}}' | \
+            curl --fail-with-body --silent --show-error \
+              --request PATCH \
+              --url "https://api.notion.com/v1/blocks/fff7538b-60b2-817b-b70e-ee83875fff53" \
+              --header "Authorization: Bearer $NOTION_TOKEN" \
+              --header "Content-Type: application/json" \
+              --header "Notion-Version: 2026-03-11" \
+              --data-binary @-
