@@ -2,6 +2,22 @@ name: weread sync
 
 on:
   workflow_dispatch:
+    inputs:
+      full-sync:
+        description: 全量匹配并更新已有书籍
+        type: boolean
+        default: false
+      existing-page-mode:
+        description: 旧页面没有同步标记时的处理方式
+        type: choice
+        options:
+          - preserve
+          - append
+        default: preserve
+      book-id:
+        description: 可选，只同步一本书的 WeRead BookId
+        type: string
+        required: false
   schedule:
     - cron: "0 0 * * *"
 
@@ -20,3 +36,6 @@ jobs:
           notion-page: ${{ secrets.NOTION_PAGE }}
           notion-database-id: ${{ secrets.NOTION_DATABASE_ID }}
           notion-data-source-id: ${{ secrets.NOTION_DATA_SOURCE_ID }}
+          full-sync: ${{ inputs.full-sync || 'false' }}
+          existing-page-mode: ${{ inputs.existing-page-mode || 'preserve' }}
+          book-id: ${{ inputs.book-id || '' }}
