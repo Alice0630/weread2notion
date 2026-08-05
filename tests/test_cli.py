@@ -174,6 +174,77 @@ class CliTestCase(unittest.TestCase):
             },
         )
 
+    def test_reading_stats_uses_annual_daily_details_when_available(self):
+        timestamp = int(
+            cli.datetime(
+                2026, 8, 5, tzinfo=cli.SHANGHAI_TIME_ZONE
+            ).timestamp()
+        )
+        cli.weread = SimpleNamespace(
+            request=Mock(return_value={"dailyReadTimes": {str(timestamp): 3661}})
+        )
+
+        result = cli.get_daily_read_times(
+            2026,
+            cli.datetime(2026, 7, 23).date(),
+            cli.datetime(2026, 8, 5, tzinfo=cli.SHANGHAI_TIME_ZONE),
+        )
+
+        self.assertEqual(result, {timestamp: 3661})
+        cli.weread.request.assert_called_once()
+
+    def test_reading_stats_falls_back_to_monthly_daily_buckets(self):
+        july_1 = int(
+            cli.datetime(
+                2026, 7, 1, tzinfo=cli.SHANGHAI_TIME_ZONE
+            ).timestamp()
+        )
+        july_31 = int(
+            cli.datetime(
+                2026, 7, 31, tzinfo=cli.SHANGHAI_TIME_ZONE
+            ).timestamp()
+        )
+        august_5 = int(
+            cli.datetime(
+                2026, 8, 5, tzinfo=cli.SHANGHAI_TIME_ZONE
+            ).timestamp()
+        )
+        cli.weread = SimpleNamespace(
+            request=Mock(
+                side_effect=[
+                    {},
+                    {"readTimes": {str(july_1): 10, str(july_31): 120}},
+                    {"readTimes": {str(august_5): 3600}},
+                ]
+            )
+        )
+
+        result = cli.get_daily_read_times(
+            2026,
+            cli.datetime(2026, 7, 23).date(),
+            cli.datetime(2026, 8, 5, tzinfo=cli.SHANGHAI_TIME_ZONE),
+        )
+
+        self.assertEqual(result, {july_31: 120, august_5: 3600})
+        self.assertEqual(
+            [call.kwargs["mode"] for call in cli.weread.request.call_args_list],
+            ["annually", "monthly", "monthly"],
+        )
+
+    def test_reading_heatmap_uses_seconds_as_hours(self):
+        svg = cli.render_reading_heatmap_svg(
+            2026,
+            {
+                cli.date(2026, 1, 1): 3600,
+                cli.date(2026, 1, 2): 1800,
+            },
+        )
+
+        self.assertIn("2026 Reading Heatmap", svg)
+        self.assertIn("2 active days &#183; 1.5 hours", svg)
+        self.assertIn("2026-01-01: 1.00 hours", svg)
+        self.assertEqual(svg.count("<rect"), 371)
+
     @patch.object(cli, "query_related_pages")
     @patch.object(cli, "get_data_source_schema")
     @patch.object(cli, "get_relation_target")

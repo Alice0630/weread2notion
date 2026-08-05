@@ -3,9 +3,10 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from notion_client import Client
 import requests
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 import hashlib
 from dotenv import load_dotenv
@@ -1628,6 +1629,211 @@ def sync_book_related_content(book_id, book_page_id, chapters, bookmarks, summar
     upsert_related_rows("读书笔记", book_page_id, "reviewId", review_rows)
 
 
+def iter_month_starts(start_date, end_date):
+    current = datetime(
+        start_date.year, start_date.month, 1, tzinfo=SHANGHAI_TIME_ZONE
+    )
+    while current.date() <= end_date:
+        yield current
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+
+
+def normalize_daily_read_times(raw_values, stats_year, start_date, end_date):
+    daily = {}
+    for raw_timestamp, seconds in (raw_values or {}).items():
+        try:
+            timestamp = int(raw_timestamp)
+        except (TypeError, ValueError):
+            continue
+        day = datetime.fromtimestamp(timestamp, SHANGHAI_TIME_ZONE).date()
+        if day.year != stats_year or day < start_date or day > end_date:
+            continue
+        daily[timestamp] = to_number(seconds) or 0
+    return daily
+
+
+def get_daily_read_times(stats_year, cutoff, anchor):
+    base_time = int(
+        datetime(stats_year, 1, 1, tzinfo=SHANGHAI_TIME_ZONE).timestamp()
+    )
+    detail = weread.request(
+        "/readdata/detail", mode="annually", baseTime=base_time
+    )
+    daily = normalize_daily_read_times(
+        detail.get("dailyReadTimes"), stats_year, cutoff, anchor.date()
+    )
+    if daily:
+        return daily
+
+    year_start = datetime(stats_year, 1, 1, tzinfo=SHANGHAI_TIME_ZONE).date()
+    year_end = datetime(stats_year, 12, 31, tzinfo=SHANGHAI_TIME_ZONE).date()
+    range_start = max(cutoff, year_start)
+    range_end = min(anchor.date(), year_end)
+    month_starts = list(iter_month_starts(range_start, range_end))
+    print(
+        f"阅读统计: {stats_year} 年度接口没有返回每日明细，"
+        f"改用 {len(month_starts)} 个月度周期"
+    )
+    for month_start in month_starts:
+        monthly = weread.request(
+            "/readdata/detail",
+            mode="monthly",
+            baseTime=int(month_start.timestamp()),
+        )
+        daily.update(
+            normalize_daily_read_times(
+                monthly.get("readTimes") or monthly.get("dailyReadTimes"),
+                stats_year,
+                range_start,
+                range_end,
+            )
+        )
+    return daily
+
+
+def get_daily_stats_from_notion(day_target_id, stats_year):
+    start_cursor = None
+    daily = {}
+    while True:
+        body = {
+            "filter": {
+                "and": [
+                    {
+                        "property": "日期",
+                        "date": {"on_or_after": f"{stats_year}-01-01"},
+                    },
+                    {
+                        "property": "日期",
+                        "date": {"before": f"{stats_year + 1}-01-01"},
+                    },
+                ]
+            },
+            "sorts": [{"property": "日期", "direction": "ascending"}],
+            "page_size": 100,
+        }
+        if start_cursor:
+            body["start_cursor"] = start_cursor
+        response = client.request(
+            path=f"data_sources/{day_target_id}/query",
+            method="POST",
+            body=body,
+        )
+        for page in response.get("results") or []:
+            properties = page.get("properties") or {}
+            start = ((properties.get("日期") or {}).get("date") or {}).get("start")
+            seconds = (properties.get("时长") or {}).get("number")
+            if not start:
+                continue
+            try:
+                day = datetime.fromisoformat(str(start).replace("Z", "+00:00")).date()
+            except (TypeError, ValueError):
+                continue
+            if day.year == stats_year:
+                daily[day] = to_number(seconds) or 0
+        if not response.get("has_more"):
+            return daily
+        start_cursor = response.get("next_cursor")
+        if not start_cursor:
+            return daily
+
+
+def render_reading_heatmap_svg(stats_year, daily_seconds):
+    year_start = date(stats_year, 1, 1)
+    year_end = date(stats_year, 12, 31)
+    sunday_offset = (year_start.weekday() + 1) % 7
+    total_days = (year_end - year_start).days + 1
+    week_count = (sunday_offset + total_days + 6) // 7
+    cell = 11
+    gap = 3
+    grid_left = 54
+    grid_top = 54
+    width = grid_left + week_count * (cell + gap) + 24
+    height = 188
+    values = [value for value in daily_seconds.values() if value > 0]
+    max_value = max(values, default=0)
+    total_hours = sum(values) / 3600
+    active_days = len(values)
+    colors = ["#ebedf0", "#c6e48b", "#7bc96f", "#239a3b", "#196127"]
+
+    def color_for(seconds):
+        if seconds <= 0 or max_value <= 0:
+            return colors[0]
+        level = min(4, max(1, int((seconds / max_value) * 4 + 0.999)))
+        return colors[level]
+
+    lines = [
+        (
+            f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" '
+            f'height="{height}" viewBox="0 0 {width} {height}">'
+        ),
+        '<rect width="100%" height="100%" fill="#ffffff"/>',
+        (
+            '<style>text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;'
+            'fill:#57606a}.title{font-size:16px;font-weight:600;fill:#24292f}'
+            '.meta{font-size:12px}.label{font-size:10px}</style>'
+        ),
+        f'<text class="title" x="8" y="21">{stats_year} Reading Heatmap</text>',
+        (
+            f'<text class="meta" x="8" y="39">{active_days} active days '
+            f'&#183; {total_hours:.1f} hours</text>'
+        ),
+    ]
+    for label, row in (("Mon", 1), ("Wed", 3), ("Fri", 5)):
+        y = grid_top + row * (cell + gap) + cell - 1
+        lines.append(f'<text class="label" x="8" y="{y}">{label}</text>')
+    month_names = (
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    )
+    for month, label in enumerate(month_names, start=1):
+        first = date(stats_year, month, 1)
+        offset = sunday_offset + (first - year_start).days
+        x = grid_left + (offset // 7) * (cell + gap)
+        lines.append(f'<text class="label" x="{x}" y="50">{label}</text>')
+    for index in range(total_days):
+        day = year_start + timedelta(days=index)
+        offset = sunday_offset + index
+        week = offset // 7
+        weekday = offset % 7
+        x = grid_left + week * (cell + gap)
+        y = grid_top + weekday * (cell + gap)
+        seconds = daily_seconds.get(day, 0)
+        hours = seconds / 3600
+        lines.append(
+            f'<rect x="{x}" y="{y}" width="{cell}" height="{cell}" '
+            f'rx="2" fill="{color_for(seconds)}">'
+            f'<title>{day.isoformat()}: {hours:.2f} hours</title></rect>'
+        )
+    legend_x = width - 150
+    lines.append(f'<text class="label" x="{legend_x}" y="172">Less</text>')
+    for level, color in enumerate(colors):
+        x = legend_x + 28 + level * (cell + gap)
+        lines.append(
+            f'<rect x="{x}" y="162" width="{cell}" height="{cell}" rx="2" fill="{color}"/>'
+        )
+    lines.append(f'<text class="label" x="{legend_x + 103}" y="172">More</text>')
+    lines.append("</svg>")
+    return "\n".join(lines)
+
+
+def write_reading_heatmap(day_target_id, stats_year):
+    try:
+        daily = get_daily_stats_from_notion(day_target_id, stats_year)
+        output = Path(
+            os.getenv("HEATMAP_OUTPUT") or "OUT_FOLDER/reading-heatmap.svg"
+        )
+        output.parent.mkdir(parents=True, exist_ok=True)
+        output.write_text(
+            render_reading_heatmap_svg(stats_year, daily), encoding="utf-8"
+        )
+        print(f"阅读热力图: 已生成 {output}，包含 {len(daily)} 天")
+    except Exception as error:
+        print(f"阅读热力图生成失败，书籍同步继续。原因: {error}")
+
+
 def sync_reading_stats():
     if not is_enabled("SYNC_READING_STATS"):
         return
@@ -1637,28 +1843,17 @@ def sync_reading_stats():
     anchor = now if stats_year == now.year else datetime(
         stats_year, 12, 31, 23, 59, tzinfo=SHANGHAI_TIME_ZONE
     )
-    base_time = int(
-        datetime(stats_year, 1, 1, tzinfo=SHANGHAI_TIME_ZONE).timestamp()
-    )
-    detail = weread.request(
-        "/readdata/detail", mode="annually", baseTime=base_time
-    )
-    daily_read_times = detail.get("dailyReadTimes") or {}
-    if not daily_read_times:
-        print(f"阅读统计: {stats_year} 年没有返回每日阅读明细")
-        return
     lookback_days = get_positive_int("STATS_LOOKBACK_DAYS", 14)
     cutoff = (anchor - timedelta(days=lookback_days - 1)).date()
+    daily_read_times = get_daily_read_times(stats_year, cutoff, anchor)
     day_target_id, _ = get_relation_target("日")
+    if not daily_read_times:
+        print(f"阅读统计: {stats_year} 年没有可写入的每日阅读明细")
+        write_reading_heatmap(day_target_id, stats_year)
+        return
     day_schema = get_data_source_schema(day_target_id)
     written = unchanged = 0
-    for timestamp, seconds in sorted(
-        daily_read_times.items(), key=lambda item: int(item[0])
-    ):
-        try:
-            timestamp = int(timestamp)
-        except (TypeError, ValueError):
-            continue
+    for timestamp, seconds in sorted(daily_read_times.items()):
         day = datetime.fromtimestamp(timestamp, SHANGHAI_TIME_ZONE)
         if day.year != stats_year or day.date() < cutoff:
             continue
@@ -1684,6 +1879,7 @@ def sync_reading_stats():
         f"阅读统计 {stats_year}: 写入 {written} 天，"
         f"未变化 {unchanged} 天（回看 {lookback_days} 天）"
     )
+    write_reading_heatmap(day_target_id, stats_year)
 
 
 def get_number_property_value(property_value):

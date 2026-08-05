@@ -74,7 +74,9 @@
 
 如果只需要修复当前年份视图，可填写 `sync-year=2026`，保持 `full-sync=true`、`batch-index=0`。程序只处理最后阅读时间属于 2026 的书，并写入 `年=2026` 关系；若超过 25 本，再继续运行下一批。
 
-首次回填 2026 阅读统计时，可使用 `sync-year=2026`、`stats-only=true`、`stats-lookback-days=366`；正常定时任务保持 `stats-only=false`、`stats-lookback-days=14`。
+首次回填 2026 阅读统计时，可使用 `sync-year=2026`、`stats-only=true`、`stats-lookback-days=366`；正常定时任务保持 `stats-only=false`、`stats-lookback-days=14`。如果年度接口不返回 `dailyReadTimes`，程序会自动按回看范围查询月度 `readTimes` 并按天合并，时长仍统一按秒写入，不再直接跳过阅读统计。
+
+同步完成后，程序会从“日”统计库生成 `OUT_FOLDER/reading-heatmap.svg`。工作流只提交这一张展示文件，并把当前仪表盘的热力图嵌入块切换到本仓库的 SVG；书籍、划线、笔记和统计数据库内容不会因此重建。首次上传新版代码后，先运行一次 `stats-only=true`、`stats-lookback-days=366`，即可回填当年每日数据并刷新热力图；以后每天 02:00 的定时任务会自动更新。
 
 ### 自定义字段名
 
