@@ -156,6 +156,24 @@ class CliTestCase(unittest.TestCase):
             },
         )
 
+    def test_period_date_does_not_duplicate_timezone_offset(self):
+        properties = cli.build_period_page_properties(
+            "月",
+            "2026年8月",
+            "标题",
+            {"标题": {"type": "title"}, "日期": {"type": "date"}},
+        )
+
+        self.assertEqual(
+            properties["日期"],
+            {
+                "date": {
+                    "start": "2026-08-01T00:00:00",
+                    "time_zone": "Asia/Shanghai",
+                }
+            },
+        )
+
     @patch.object(cli, "query_related_pages")
     @patch.object(cli, "get_data_source_schema")
     @patch.object(cli, "get_relation_target")

@@ -1268,7 +1268,9 @@ def build_period_page_properties(property_name, value, target_title, schema):
     if not start:
         return properties
     if (schema.get("日期") or {}).get("type") == "date":
-        properties["日期"] = get_date(start.isoformat())
+        # get_date declares Asia/Shanghai separately, so the value itself must
+        # not also contain a non-zero UTC offset under Notion API 2026-03-11.
+        properties["日期"] = get_date(start.strftime("%Y-%m-%dT%H:%M:%S"))
     if property_name == "日" and (schema.get("时间戳") or {}).get("type") == "number":
         properties["时间戳"] = get_number(int(start.timestamp()))
     if property_name == "日":
@@ -1329,8 +1331,7 @@ def build_relation_property(name, value):
     except Exception as error:
         if name not in relation_error_names:
             print(
-                f"属性 {name} 的关联库暂时无法写入，保留原值。"
-                f"请确认 Notion Integration 已连接该关联库。原因: {error}"
+                f"属性 {name} 的关联库写入失败，保留原值。原因: {error}"
             )
             relation_error_names.add(name)
         return None
