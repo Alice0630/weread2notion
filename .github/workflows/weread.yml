@@ -11,15 +11,16 @@ on:
         description: 旧页面没有同步标记时的处理方式
         type: choice
         options:
-          - preserve
           - append
-        default: preserve
+          - preserve
+        default: append
       book-id:
         description: 可选，只同步一本书的 WeRead BookId
         type: string
         required: false
   schedule:
-    - cron: "0 0 * * *"
+    # GitHub Actions cron uses UTC. 18:00 UTC = 02:00 Asia/Shanghai.
+    - cron: "0 18 * * *"
 
 jobs:
   sync:
@@ -37,5 +38,5 @@ jobs:
           notion-database-id: ${{ secrets.NOTION_DATABASE_ID }}
           notion-data-source-id: ${{ secrets.NOTION_DATA_SOURCE_ID }}
           full-sync: ${{ inputs.full-sync || 'false' }}
-          existing-page-mode: ${{ inputs.existing-page-mode || 'preserve' }}
+          existing-page-mode: ${{ inputs.existing-page-mode || 'append' }}
           book-id: ${{ inputs.book-id || '' }}
