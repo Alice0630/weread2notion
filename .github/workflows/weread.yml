@@ -95,7 +95,10 @@ jobs:
             git commit -m "Update reading heatmap"
             git push origin "HEAD:${GITHUB_REF_NAME}"
           fi
-          heatmap_url="https://heatmap.malinkang.com/?image=https://raw.githubusercontent.com/Alice0630/weread2notion/main/OUT_FOLDER/reading-heatmap.svg"
+          heatmap_commit="$(git rev-parse HEAD)"
+          heatmap_image="https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${heatmap_commit}/OUT_FOLDER/reading-heatmap.svg"
+          heatmap_url="https://heatmap.malinkang.com/?image=${heatmap_image}"
+          echo "Heatmap commit: ${heatmap_commit}"
           jq -nc --arg url "$heatmap_url" '{embed:{url:$url}}' | \
             curl --fail-with-body --silent --show-error \
               --request PATCH \
