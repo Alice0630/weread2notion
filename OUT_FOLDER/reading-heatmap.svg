@@ -2,7 +2,7 @@
 <rect width="100%" height="100%" fill="#ffffff"/>
 <style>text{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;fill:#57606a}.title{font-size:16px;font-weight:600;fill:#24292f}.meta{font-size:12px}.label{font-size:10px}</style>
 <text class="title" x="8" y="21">2026 Reading Heatmap</text>
-<text class="meta" x="8" y="39">175 active days &#183; 209.7 hours</text>
+<text class="meta" x="8" y="39">176 active days &#183; 211.1 hours</text>
 <text class="label" x="8" y="78">Mon</text>
 <text class="label" x="8" y="106">Wed</text>
 <text class="label" x="8" y="134">Fri</text>
@@ -264,8 +264,8 @@
 <rect x="544" y="82" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-01: 0.32 hours</title></rect>
 <rect x="544" y="96" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-02: 0.49 hours</title></rect>
 <rect x="544" y="110" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-03: 0.40 hours</title></rect>
-<rect x="544" y="124" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-04: 0.28 hours</title></rect>
-<rect x="544" y="138" width="11" height="11" rx="2" fill="#ebedf0"><title>2026-09-05: 0.00 hours</title></rect>
+<rect x="544" y="124" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-04: 1.42 hours</title></rect>
+<rect x="544" y="138" width="11" height="11" rx="2" fill="#c6e48b"><title>2026-09-05: 0.24 hours</title></rect>
 <rect x="558" y="54" width="11" height="11" rx="2" fill="#ebedf0"><title>2026-09-06: 0.00 hours</title></rect>
 <rect x="558" y="68" width="11" height="11" rx="2" fill="#ebedf0"><title>2026-09-07: 0.00 hours</title></rect>
 <rect x="558" y="82" width="11" height="11" rx="2" fill="#ebedf0"><title>2026-09-08: 0.00 hours</title></rect>
