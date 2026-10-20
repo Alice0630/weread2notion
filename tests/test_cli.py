@@ -113,6 +113,41 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual(cli.normalize_reading_progress(0.2), 0.2)
         self.assertEqual(cli.normalize_reading_progress(150), 1)
 
+    def test_gateway_request_reports_skill_version(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {"errcode": 0, "ok": True}
+        gateway = cli.WeReadGatewayClient("test-key")
+        gateway.session = SimpleNamespace(post=Mock(return_value=response))
+
+        result = gateway.request("/test", sample="value")
+
+        self.assertEqual(result, {"errcode": 0, "ok": True})
+        payload = gateway.session.post.call_args.kwargs["json"]
+        self.assertEqual(payload["skill_version"], "1.0.5")
+        self.assertEqual(payload["api_name"], "/test")
+        self.assertEqual(payload["sample"], "value")
+
+    def test_gateway_upgrade_error_is_not_retried(self):
+        response = Mock()
+        response.raise_for_status = Mock()
+        response.json.return_value = {
+            "upgrade_info": {
+                "latest_version": "1.0.6",
+                "upgrade_url": "https://example.com/skill.zip",
+            }
+        }
+        gateway = cli.WeReadGatewayClient("test-key")
+        gateway.session = SimpleNamespace(post=Mock(return_value=response))
+
+        with self.assertRaisesRegex(
+            cli.WeReadSkillUpgradeError,
+            r"当前上报 1\.0\.5.*升级地址: https://example\.com/skill\.zip",
+        ):
+            gateway.request("/test")
+
+        gateway.session.post.assert_called_once()
+
     def test_progress_falls_back_to_legacy_writable_number(self):
         cli.data_source_property_types.pop("阅读进度")
 

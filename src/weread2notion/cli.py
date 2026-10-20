@@ -81,6 +81,10 @@ class ConfigError(Exception):
     pass
 
 
+class WeReadSkillUpgradeError(Exception):
+    """Raised when the Gateway requires a newer WeRead skill version."""
+
+
 def emit_error(message):
     if os.getenv("GITHUB_ACTIONS") == "true":
         safe = message.replace("%", "%25").replace("\r", "%0D").replace("\n", "%0A")
@@ -244,7 +248,13 @@ class WeReadGatewayClient:
             }
         )
 
-    @retry(stop_max_attempt_number=3, wait_fixed=5000)
+    @retry(
+        stop_max_attempt_number=3,
+        wait_fixed=5000,
+        retry_on_exception=lambda error: not isinstance(
+            error, WeReadSkillUpgradeError
+        ),
+    )
     def request(self, api_name, **kwargs):
         payload = {
             "api_name": api_name,
@@ -255,7 +265,15 @@ class WeReadGatewayClient:
         response.raise_for_status()
         data = response.json()
         if data.get("upgrade_info"):
-            raise Exception(f"微信读书 skill 需要升级: {data.get('upgrade_info')}")
+            upgrade_info = data.get("upgrade_info") or {}
+            latest_version = upgrade_info.get("latest_version")
+            upgrade_url = upgrade_info.get("upgrade_url")
+            details = f"当前上报 {WEREAD_SKILL_VERSION}"
+            if latest_version:
+                details += f"，Gateway 要求 {latest_version}"
+            if upgrade_url:
+                details += f"，升级地址: {upgrade_url}"
+            raise WeReadSkillUpgradeError(f"微信读书 Skill 版本不匹配：{details}")
         if data.get("errcode", 0) != 0:
             raise Exception(f"微信读书 Gateway 请求失败: {api_name}, errcode={data.get('errcode')}, response={data}")
         return data

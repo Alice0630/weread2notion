@@ -91,6 +91,10 @@
 
 ## 使用文档
 
+### 微信读书 Skill 版本错误
+
+Gateway 会检查请求中的 Skill 版本。本仓库已按随附的 `weread-skills` `1.0.5` 上报版本；如果日志仍显示当前版本为 `1.0.4`，说明 GitHub Actions 没有运行最新提交，请确认工作流的 `Checkout` 步骤拉取的是包含本次修改的分支。升级响应会立即停止重试，并在日志中显示 Gateway 返回的升级地址。
+
 完整教程请查看：
 
 https://www.notionhub.app/docs/weread2notion.html
